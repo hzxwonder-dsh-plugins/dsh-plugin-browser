@@ -1,6 +1,6 @@
 # DSH Browser Plugin
 
-Session-isolated Playwright browser tools for DeepSeek Harness 0.1.5-rc.2. A visible Chromium window supports manual login; automation and screenshots use official Harness tool and attachment APIs.
+Session-isolated Playwright browser tools plus a user-visible browser page in the DeepSeek Harness right Sidebar. The page uses the official client Sidebar extension API; automation and screenshots continue to use the independent Harness tool and attachment APIs.
 
 ## Install
 
@@ -22,6 +22,10 @@ Requires Node.js 22.19+ and Chromium system dependencies. Use the same `DSH_HOME
 ```
 
 On Linux servers without a display, set `headless: true`. Interactive login requires a visible display. Each Harness session gets its own ephemeral browser context, up to eight at a time. Login persists until the tool's `close` action or Harness shutdown. User browser profiles and Desktop browser data are not imported.
+
+## Right Sidebar
+
+The Harness right Sidebar guide includes a `Browser` page. Opening it starts at `http://127.0.0.1:3099/`; enter another HTTP(S) address and choose `Go`. The page is an isolated sandboxed iframe inside the Harness web client, so it does not reuse the Playwright context, cookies, or login state. A site may refuse embedded viewing through `X-Frame-Options` or Content Security Policy; use the `browser` tool for pages that require a real Chromium context or manual login.
 
 ## Tool
 

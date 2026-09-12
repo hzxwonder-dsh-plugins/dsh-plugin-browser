@@ -2,6 +2,19 @@ import {test} from 'node:test';
 import assert from 'node:assert/strict';
 import {createServer} from 'node:http';
 import {BrowserSessions, httpUrl, redact, redactValue} from '../browser.js';
+import {readFile} from 'node:fs/promises';
+
+test('package declares the official right Sidebar client bundle', async () => {
+  const packageJson = JSON.parse(await readFile(new URL('../package.json', import.meta.url), 'utf8'));
+  const client = await readFile(new URL('../client.js', import.meta.url), 'utf8');
+  assert.equal(packageJson.exports['./client'], './client.js');
+  assert.equal(packageJson.dsh.client.platform, 'web');
+  assert.deepEqual(packageJson.dsh.client.inject, ['@deepseek-ai/dsh-client-ui-sidebar-right']);
+  assert.match(client, /window\.__ModuleLoader__\.load/);
+  assert.match(client, /sidebar\.right\.pane\.tab/);
+  assert.match(client, /sidebarRightTabs\.register/);
+  assert.doesNotMatch(client, /javascript:|data:|file:/);
+});
 
 test('navigation admits credential-free HTTP(S) only', () => {
   assert.equal(httpUrl('http://127.0.0.1:3080'), 'http://127.0.0.1:3080/');
