@@ -49,6 +49,14 @@ export function viewportBounds(width, height) {
   return {width, height};
 }
 
+/** The tab the pane shows and every action addresses. */
+function activeTab(session) {
+  return session.tabs.find(tab => tab.id === session.activeId) ?? session.tabs[0];
+}
+
+/** Pane actions that answer without waiting for the action queue. */
+const CONTROL_ACTIONS = new Set(['_view', '_hover', '_selection', '_stop']);
+
 const SCREENCAST_QUALITY = 62;
 
 /**
@@ -128,39 +136,28 @@ export class BrowserSessions {
       await context.route('**/*', route => {
         try { httpUrl(route.request().url()); return route.continue(); } catch { return route.abort(); }
       });
-      const page = await context.newPage();
-      const messages = [];
-      page.setDefaultTimeout(10000);
-      page.setDefaultNavigationTimeout(30000);
-      page.on('console', message => {
-        messages.push({level: message.type(), text: redact(message.text(), 2000)});
-        if (messages.length > 100) messages.shift();
-      });
-      page.on('pageerror', error => {
-        messages.push({level: 'error', text: redact(error.message, 2000)});
-        if (messages.length > 100) messages.shift();
-      });
-      page.on('dialog', dialog => { void dialog.dismiss().catch(() => {}); });
-      context.on('page', popup => { if (popup !== page) void popup.close().catch(() => {}); });
       const session = {
-        context, page, messages, observation: 0,
-        subscribers: new Set(), screencast: false, pattern: 0,
-        pointer: undefined, viewport: page.viewportSize(),
+        context, observation: 0, tabSeq: 0, tabs: [], activeId: undefined,
+        subscribers: new Set(), screencast: false, streamingId: undefined, pattern: 0,
+        pointer: undefined, viewport: {width: 1280, height: 800},
       };
-      // One CDP session per page drives the Sidebar's live picture: event-driven
-      // JPEG frames instead of repeated full PNG screenshots.
-      session.cdp = await context.newCDPSession(page);
-      session.cdp.on('Page.screencastFrame', frame => {
-        void session.cdp.send('Page.screencastFrameAck', {sessionId: frame.sessionId}).catch(() => {});
-        if (!session.screencast) return;
-        session.pattern += 1;
-        this.emit(session, {t: 'frame', seq: session.pattern, data: frame.data, mediaType: 'image/jpeg', viewport: {...session.viewport}});
+      // The pane's chrome reads the active tab for url, viewport and messages,
+      // so the rest of the Host keeps addressing one page at a time.
+      Object.defineProperties(session, {
+        page: {get: () => activeTab(session).page},
+        messages: {get: () => activeTab(session).messages},
+        loading: {get: () => activeTab(session).loading},
+        canGoBack: {get: () => activeTab(session).index > 0},
+        canGoForward: {get: () => activeTab(session).index < activeTab(session).history.length - 1},
       });
-      page.on('framenavigated', frame => {
-        if (frame !== page.mainFrame()) return;
-        session.observation += 1;
-        this.emit(session, {t: 'state', url: page.url(), observation: session.observation});
+      await this.openTab(session, await context.newPage());
+      context.on('page', popup => {
+        // A page the site opened by itself (target=_blank, window.open) becomes
+        // a managed tab in the pane instead of an invisible extra window.
+        if (session.tabs.some(tab => tab.page === popup)) return;
+        void this.openTab(session, popup).then(entry => this.select(session, entry.id)).catch(() => {});
       });
+      context.on('close', () => { session.subscribers.forEach(subscriber => subscriber.close()); });
       return session;
     })();
     this.sessions.set(id, pending);
@@ -170,6 +167,145 @@ export class BrowserSessions {
   /** Push one event to every Sidebar subscriber of this session. */
   emit(session, event) {
     for (const subscriber of session.subscribers) subscriber.push(event);
+  }
+
+  /** Tell every pane reader what the active tab is doing. */
+  emitState(session) {
+    this.emit(session, {
+      t: 'state', active: true, tabId: session.activeId, url: session.page.url(),
+      observation: session.observation, loading: session.loading,
+      canGoBack: session.canGoBack, canGoForward: session.canGoForward,
+    });
+  }
+
+  emitTabs(session) {
+    this.emit(session, {t: 'tabs', activeId: session.activeId, tabs: this.tabList(session)});
+  }
+
+  /** One tab's loading flag, published only while that tab is on screen. */
+  markLoading(session, entry, loading) {
+    if (entry.loading === loading) return;
+    entry.loading = loading;
+    if (session.activeId !== entry.id) return;
+    this.emitState(session);
+    this.emitTabs(session);
+  }
+
+  tabList(session) {
+    return session.tabs.map(entry => ({
+      id: entry.id, url: redact(entry.page.url(), 400),
+      loading: entry.loading, active: entry.id === session.activeId,
+    }));
+  }
+
+  /**
+   * Register one Chromium page as a managed tab. Each tab keeps its own history
+   * and console, while the pane always shows and drives the active one. A page
+   * the Site opened and the pane's own new-tab button can both reach the same
+   * Chromium page, so registering it twice returns the tab that already exists.
+   */
+  async openTab(session, page) {
+    const known = session.tabs.find(tab => tab.page === page);
+    if (known) return known;
+    const entry = {
+      id: `tab-${++session.tabSeq}`, page, cdp: undefined, messages: [],
+      history: [page.url()], index: 0, loading: false, loadTimer: undefined,
+    };
+    page.setDefaultTimeout(10000);
+    page.setDefaultNavigationTimeout(30000);
+    page.on('console', message => {
+      entry.messages.push({level: message.type(), text: redact(message.text(), 2000)});
+      if (entry.messages.length > 100) entry.messages.shift();
+    });
+    page.on('pageerror', error => {
+      entry.messages.push({level: 'error', text: redact(error.message, 2000)});
+      if (entry.messages.length > 100) entry.messages.shift();
+    });
+    page.on('dialog', dialog => { void dialog.dismiss().catch(() => {}); });
+    // A navigation request is the earliest honest progress signal; the load
+    // event closes it, and a stalled request cannot hold the bar forever.
+    page.on('request', request => {
+      if (!request.isNavigationRequest() || request.frame() !== page.mainFrame()) return;
+      this.markLoading(session, entry, true);
+      clearTimeout(entry.loadTimer);
+      entry.loadTimer = setTimeout(() => this.markLoading(session, entry, false), 30000);
+    });
+    page.on('load', () => {
+      clearTimeout(entry.loadTimer);
+      this.markLoading(session, entry, false);
+    });
+    page.on('framenavigated', frame => {
+      if (frame !== page.mainFrame()) return;
+      const url = page.url();
+      // A back or forward move lands on an entry this tab already knows, so the
+      // history pointer follows it instead of appending a duplicate.
+      const rewind = entry.pending !== undefined && entry.history[entry.pending] === url ? entry.pending : undefined;
+      entry.pending = undefined;
+      if (entry.history[entry.index] !== url) {
+        if (rewind === undefined) {
+          entry.history = entry.history.slice(0, entry.index + 1);
+          entry.history.push(url);
+          if (entry.history.length > 50) entry.history.shift();
+          entry.index = entry.history.length - 1;
+        } else entry.index = rewind;
+      }
+      if (session.activeId !== entry.id) return;
+      session.observation += 1;
+      this.emitState(session);
+    });
+    page.on('close', () => { void this.dropTab(session, entry.id).catch(() => {}); });
+    session.tabs.push(entry);
+    session.activeId ??= entry.id;
+    this.emitTabs(session);
+    if (session.subscribers.size > 0) await this.viewport(session, session.viewport, {force: true});
+    return entry;
+  }
+
+  /** Show one tab: its page becomes the pane picture and the input target. */
+  async select(session, id) {
+    if (!session.tabs.some(tab => tab.id === id)) throw new Error('BROWSER_UNKNOWN_TAB');
+    if (session.activeId === id) return this.tabList(session);
+    session.activeId = id;
+    session.observation += 1;
+    this.emitTabs(session);
+    if (session.subscribers.size > 0) await this.viewport(session, session.viewport, {force: true});
+    this.emitState(session);
+    return this.tabList(session);
+  }
+
+  /** Forget one tab, keeping the pane on a live neighbour. */
+  async dropTab(session, id) {
+    const index = session.tabs.findIndex(tab => tab.id === id);
+    if (index === -1) return this.tabList(session);
+    const [entry] = session.tabs.splice(index, 1);
+    if (session.streamingId === id) {
+      session.streamingId = undefined;
+      await entry.cdp?.send('Page.stopScreencast').catch(() => {});
+    }
+    await entry.cdp?.detach().catch(() => {});
+    if (session.activeId !== id) { this.emitTabs(session); return this.tabList(session); }
+    const next = session.tabs[index] ?? session.tabs[index - 1];
+    if (next) await this.select(session, next.id);
+    else await this.openTab(session, await session.context.newPage()).then(created => this.select(session, created.id));
+    return this.tabList(session);
+  }
+
+  /** Close one tab from the pane or the Agent, never leaving the pane empty. */
+  async closeTab(session, id) {
+    const entry = session.tabs.find(tab => tab.id === id);
+    if (!entry) throw new Error('BROWSER_UNKNOWN_TAB');
+    if (session.tabs.length === 1) {
+      await entry.page.goto('about:blank').catch(() => {});
+      entry.history = ['about:blank'];
+      entry.index = 0;
+      session.observation += 1;
+      this.emitTabs(session);
+      this.emitState(session);
+      return this.tabList(session);
+    }
+    await entry.page.close().catch(() => {});
+    await this.dropTab(session, id);
+    return this.tabList(session);
   }
 
   /**
@@ -184,6 +320,7 @@ export class BrowserSessions {
     session.subscribers.add(subscriber);
     signal.addEventListener('abort', () => { subscriber.close(); }, {once: true});
     await this.screencast(session, true);
+    this.emitTabs(session);
     return {
       next: () => subscriber.next(),
       async release() {
@@ -194,20 +331,28 @@ export class BrowserSessions {
     };
   }
 
+  /**
+   * Follow the active tab with CDP screencast frames. Switching tabs stops the
+   * old page's stream and starts the new one, so pictures never mix.
+   */
   async screencast(session, on) {
-    if (on === session.screencast) return;
-    session.screencast = on;
+    const entry = on ? activeTab(session) : undefined;
+    if (session.streamingId === entry?.id) return;
+    const previous = session.tabs.find(tab => tab.id === session.streamingId);
+    session.streamingId = undefined;
+    session.screencast = Boolean(on);
+    if (previous?.cdp) await previous.cdp.send('Page.stopScreencast').catch(() => {});
+    if (!on) return;
     try {
-      if (on) {
-        const {width, height} = session.viewport;
-        await session.cdp.send('Page.startScreencast', {
-          format: 'jpeg',
-          quality: SCREENCAST_QUALITY,
-          everyNthFrame: 1,
-          maxWidth: Math.min(1920, Math.round(width * 1.5)),
-          maxHeight: Math.min(1600, Math.round(height * 1.5)),
-        });
-      } else await session.cdp.send('Page.stopScreencast');
+      const {width, height} = session.viewport;
+      await (await this.attach(session, entry)).send('Page.startScreencast', {
+        format: 'jpeg',
+        quality: SCREENCAST_QUALITY,
+        everyNthFrame: 1,
+        maxWidth: Math.min(1920, Math.round(width * 1.5)),
+        maxHeight: Math.min(1600, Math.round(height * 1.5)),
+      });
+      session.streamingId = entry.id;
     } catch {
       // A page that is navigating away can reject either command; the next
       // subscriber or action restarts the stream.
@@ -215,16 +360,30 @@ export class BrowserSessions {
     }
   }
 
-  async viewport(session, size) {
+  /** One CDP session per tab, created on first use. */
+  async attach(session, entry) {
+    if (entry.cdp) return entry.cdp;
+    const cdp = await session.context.newCDPSession(entry.page);
+    cdp.on('Page.screencastFrame', frame => {
+      void cdp.send('Page.screencastFrameAck', {sessionId: frame.sessionId}).catch(() => {});
+      if (!session.screencast || session.activeId !== entry.id) return;
+      session.pattern += 1;
+      this.emit(session, {t: 'frame', seq: session.pattern, data: frame.data, mediaType: 'image/jpeg', viewport: {...session.viewport}});
+    });
+    entry.cdp = cdp;
+    return cdp;
+  }
+
+  async viewport(session, size, {force = false} = {}) {
     const next = viewportBounds(size.width, size.height);
     const current = session.viewport;
-    if (current.width === next.width && current.height === next.height) return current;
+    if (!force && current.width === next.width && current.height === next.height) return current;
     const wasStreaming = session.screencast;
     if (wasStreaming) await this.screencast(session, false);
     await session.page.setViewportSize(next);
     session.viewport = next;
     session.observation++;
-    this.emit(session, {t: 'state', url: session.page.url(), observation: session.observation});
+    this.emitState(session);
     if (wasStreaming) await this.screencast(session, true);
     return next;
   }
@@ -273,13 +432,22 @@ export class BrowserSessions {
 
   async run(id, args, signal) {
     if (!id) throw new Error('BROWSER_SESSION_REQUIRED');
+    // The pane's control plane — looking at the page, reading its selection and
+    // stopping a load — answers while a slow navigation is still in flight,
+    // exactly like a browser's own stop and reload buttons.
+    if (CONTROL_ACTIONS.has(args.action)) {
+      const session = await this.session(id);
+      return this.operate(session, args);
+    }
     const previous = this.queues.get(id) ?? Promise.resolve();
     const current = previous.catch(() => {}).then(async () => {
       signal.throwIfAborted();
       if (args.action === 'close') { await this.close(id); return {closed: true}; }
       const session = await this.session(id);
       let closing;
-      const abort = () => { if (args.action !== '_view') closing = this.close(id); };
+      // Reads and the pane's own chrome never tear the browser down when the
+      // caller goes away; only an interrupted page action does.
+      const abort = () => { if (!CONTROL_ACTIONS.has(args.action) && args.action !== '_tabs') closing = this.close(id); };
       signal.addEventListener('abort', abort, {once: true});
       try {
         signal.throwIfAborted();
@@ -296,7 +464,7 @@ export class BrowserSessions {
 
   async snapshot(session) {
     session.observation++;
-    return {url: redact(session.page.url()), title: redact(await session.page.title(), 500), observation: session.observation, snapshot: redact(await session.page.locator('body').ariaSnapshot({timeout: 10000}))};
+    return {url: redact(session.page.url()), title: redact(await session.page.title(), 500), tab: session.activeId, tabs: this.tabList(session), observation: session.observation, snapshot: redact(await session.page.locator('body').ariaSnapshot({timeout: 10000}))};
   }
 
   async operate(session, args) {
@@ -307,7 +475,38 @@ export class BrowserSessions {
       if (args.width !== undefined || args.height !== undefined) await this.viewport(session, {width: args.width, height: args.height});
       const data = await page.screenshot({type: 'jpeg', quality: 62, timeout: 5000});
       session.pattern += 1;
-      return {active: true, image: data.toString('base64'), mediaType: 'image/jpeg', url: page.url(), title: await page.title(), ...session.viewport, observation: session.observation, seq: session.pattern};
+      return {
+        active: true, image: data.toString('base64'), mediaType: 'image/jpeg', url: page.url(), title: await page.title(),
+        tab: session.activeId, tabs: this.tabList(session), loading: session.loading,
+        canGoBack: session.canGoBack, canGoForward: session.canGoForward,
+        ...session.viewport, observation: session.observation, seq: session.pattern,
+      };
+    }
+    if (args.action === '_tabs') {
+      // Switching tabs bumps the observation, so the Agent is told to look
+      // again; listing tabs is a pure read like hovering.
+      if (args.op === undefined || args.op === 'list') return {tabs: this.tabList(session), activeId: session.activeId};
+      if (args.op === 'new') {
+        const entry = await this.openTab(session, await session.context.newPage());
+        await this.select(session, entry.id);
+        return {tabs: this.tabList(session), activeId: session.activeId, observation: session.observation};
+      }
+      if (args.op === 'select') { await this.select(session, args.tab); return {tabs: this.tabList(session), activeId: session.activeId, observation: session.observation}; }
+      if (args.op === 'close') { await this.closeTab(session, args.tab); return {tabs: this.tabList(session), activeId: session.activeId, observation: session.observation}; }
+      throw new Error('BROWSER_INVALID_ACTION');
+    }
+    if (args.action === '_stop') {
+      // window.stop() ends the load the way the browser's own stop button does;
+      // whatever has already arrived stays on screen.
+      await page.evaluate(() => window.stop()).catch(() => {});
+      this.markLoading(session, activeTab(session), false);
+      return {observation: session.observation, stopped: true};
+    }
+    if (args.action === '_selection') {
+      // A pure read: the pane copies the page's own selection into the human's
+      // clipboard without touching the observation counter.
+      const text = await page.evaluate(() => window.getSelection()?.toString() ?? '').catch(() => '');
+      return {text: redact(text, 8000)};
     }
     if (args.action === '_hover') {
       // A pure read: hovering never consumes an observation, so an Agent's next
@@ -351,10 +550,13 @@ export class BrowserSessions {
     }
     if (['_back', '_forward', '_reload'].includes(args.action)) {
       session.observation++;
-      if (args.action === '_back') await page.goBack({waitUntil: 'domcontentloaded'});
-      if (args.action === '_forward') await page.goForward({waitUntil: 'domcontentloaded'});
-      if (args.action === '_reload') await page.reload({waitUntil: 'domcontentloaded'});
-      this.emit(session, {t: 'state', url: page.url(), observation: session.observation});
+      const entry = activeTab(session);
+      // Point the tab's history at the entry the move targets, so the pane's
+      // back and forward buttons keep matching what the browser will do next.
+      if (args.action === '_back' && entry.index > 0) { entry.pending = entry.index - 1; await page.goBack({waitUntil: 'domcontentloaded'}).catch(() => {}); }
+      if (args.action === '_forward' && entry.index < entry.history.length - 1) { entry.pending = entry.index + 1; await page.goForward({waitUntil: 'domcontentloaded'}).catch(() => {}); }
+      if (args.action === '_reload') await page.reload({waitUntil: 'domcontentloaded'}).catch(() => {});
+      this.emitState(session);
       return {observation: session.observation};
     }
     if (args.action === 'navigate') {
@@ -420,7 +622,7 @@ export class BrowserSessions {
 
   /** Publish the post-action URL and focus so the Sidebar follows the Agent. */
   async afterAction(session, detail) {
-    this.emit(session, {t: 'state', url: session.page.url(), observation: session.observation, action: detail.action});
+    this.emitState(session);
     this.emit(session, {t: 'focus', focus: await this.focused(session).catch(() => null), observation: session.observation});
   }
 
@@ -433,7 +635,10 @@ export class BrowserSessions {
     for (const subscriber of session.subscribers) subscriber.close();
     session.subscribers.clear();
     session.screencast = false;
-    await session.cdp?.detach().catch(() => {});
+    for (const tab of session.tabs) {
+      clearTimeout(tab.loadTimer);
+      await tab.cdp?.detach().catch(() => {});
+    }
     await session.context.close();
   }
 
@@ -493,12 +698,23 @@ export function eventStream(browsers, id, size, request) {
         try { controller.close(); } catch { /* already closed */ }
         return;
       }
-      send({t: 'hello', active: true, viewport: session.viewport, url: session.page.url()});
-      while (!closed) {
-        const event = await reader.next();
-        if (event === undefined) break;
-        send(event);
-      }
+      send({
+        t: 'hello', active: true, viewport: session.viewport, url: session.page.url(),
+        tabId: session.activeId, tabs: browsers.tabList(session), loading: session.loading,
+        canGoBack: session.canGoBack, canGoForward: session.canGoForward,
+        observation: session.observation,
+      });
+      // Pictures are change-driven, so a quiet page is silent on purpose. This
+      // beat tells the pane whether the stream is healthy and whether frames
+      // are actually being produced, without inventing pictures.
+      const beat = setInterval(() => send({t: 'tick', at: Date.now(), screencast: session.streamingId !== undefined}), 2000);
+      try {
+        while (!closed) {
+          const event = await reader.next();
+          if (event === undefined) break;
+          send(event);
+        }
+      } finally { clearInterval(beat); }
       if (!closed) {
         closed = true;
         try { controller.close(); } catch { /* already closed */ }

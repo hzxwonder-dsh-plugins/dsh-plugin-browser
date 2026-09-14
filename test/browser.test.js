@@ -131,6 +131,49 @@ test('Sidebar API reports missing runtime and retains a usable inactive session'
   } finally { await dispose(); }
 });
 
+test('the tab action and the pane clipboard stay inside the published contract', async () => {
+  const routes = new Map();
+  const tools = [];
+  const client = await readFile(new URL('../client.js', import.meta.url), 'utf8');
+  let dispose;
+  apply({
+    effect: setup => { dispose = setup(); },
+    on() {},
+    tools: {register: tool => tools.push(tool)},
+    inject: (_services, setup) => setup({
+      connection: {fetch: {register: route => { routes.set(route.path, route.fetch); }}},
+      sessions: {get: id => id === 'tabs-test' ? {id} : undefined},
+      // A read-only Session may look at the tabs and the selection, never move them.
+      get: name => name === 'sandboxPolicy' ? {resolve: () => ({mode: 'read-only'})} : undefined,
+    }),
+  }, {executablePath: '/nonexistent/dsh-browser/chrome'});
+  try {
+    const tool = tools.find(entry => entry.name === 'browser');
+    assert.equal(tool.parameters.properties.action.enum.includes('tabs'), true);
+    assert.deepEqual(tool.parameters.properties.op.enum, ['list', 'new', 'select', 'close']);
+    assert.match(tool.description, /manage the browser tabs/);
+    // The pane's own chrome speaks the same contract as the tool.
+    assert.match(client, /data-dsh-browser": "tabs"/);
+    assert.match(client, /data-dsh-browser-tab/);
+    assert.match(client, /action: "_tabs"/);
+    assert.match(client, /action: "_stop"/);
+    assert.match(client, /action: "_selection"/);
+    assert.match(client, /navigator\.clipboard\.writeText/);
+    assert.match(client, /Desktop layout|layoutDesktop/);
+    assert.match(client, /event\.t === "tick"/);
+    const endpoint = routes.get('/api/dsh-browser');
+    const post = args => endpoint(new Request('http://127.0.0.1/api/dsh-browser?sessionId=tabs-test', {method: 'POST', body: JSON.stringify(args)}));
+    assert.deepEqual(await (await post({action: '_unknown'})).json(), {error: 'BROWSER_INVALID_ACTION'});
+    assert.deepEqual(await (await post({action: '_view'})).json(), {error: 'BROWSER_INVALID_ACTION'});
+    // Allowed reads reach the runtime, which is deliberately missing here.
+    assert.deepEqual(await (await post({action: '_tabs', op: 'list'})).json(), {error: 'BROWSER_RUNTIME_MISSING'});
+    assert.deepEqual(await (await post({action: '_selection'})).json(), {error: 'BROWSER_RUNTIME_MISSING'});
+    assert.deepEqual(await (await post({action: '_tabs', op: 'new'})).json(), {error: 'BROWSER_READ_ONLY'});
+    assert.deepEqual(await (await post({action: '_stop'})).json(), {error: 'BROWSER_RUNTIME_MISSING'});
+    assert.deepEqual(await (await post({action: '_input', kind: 'click', x: 4, y: 4})).json(), {error: 'BROWSER_READ_ONLY'});
+  } finally { await dispose(); }
+});
+
 const configuredBrowser = process.env.BROWSER_TEST_EXECUTABLE;
 const managedBrowser = chromium.executablePath();
 const chromiumUnavailable = !configuredBrowser && !existsSync(managedBrowser);
@@ -233,4 +276,96 @@ test('real Chromium navigates, fills, clicks, streams, isolates and closes', {sk
     await run({action: 'close'});
     assert.equal(browsers.sessions.has('test-session'), false);
   } finally { controller.abort(); await browsers.dispose(); await new Promise(resolve => server.close(resolve)); }
+});
+
+test('tabs, history and the pane selection stay in sync', {skip: chromiumUnavailable ? `Chromium executable is unavailable at ${managedBrowser}; set BROWSER_TEST_EXECUTABLE to run this integration test` : false}, async () => {
+  const server = createServer((request, response) => {
+    const path = new URL(request.url, 'http://127.0.0.1').pathname;
+    const page = (title, body) => { response.setHeader('Content-Type', 'text/html'); response.end(`<!doctype html><title>${title}</title>${body}`); };
+    if (path === '/slow') { setTimeout(() => page('Slow', '<h1>Slow page</h1>'), 2500); return; }
+    if (path === '/next') { page('Second', '<h1>Second page</h1>'); return; }
+    page('First', '<h1>First page</h1><p id="line">Selectable line</p><a href="/next">Next page</a><a href="/next" target="_blank">Popup page</a>');
+  });
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  const base = `http://127.0.0.1:${server.address().port}`;
+  const browsers = new BrowserSessions({headless: true, ...(configuredBrowser ? {executablePath: configuredBrowser} : {})});
+  const signal = new AbortController().signal;
+  const run = args => browsers.run('tab-session', args, signal);
+  const settle = async (attempts = 25) => {
+    let list = await run({action: '_tabs'});
+    for (let attempt = 0; attempt < attempts && list.tabs.length < 2; attempt++) {
+      await new Promise(resolve => setTimeout(resolve, 100));
+      list = await run({action: '_tabs'});
+    }
+    return list;
+  };
+  try {
+    const first = await run({action: 'navigate', url: base});
+    assert.equal(first.tabs.length, 1);
+    assert.equal(first.tabs[0].id, first.tab);
+    assert.match(first.snapshot, /First page/);
+
+    // A page the site opens by itself becomes a managed tab, and the pane
+    // follows it the way a foreground browser tab does.
+    await run({action: 'click', role: 'link', name: 'Popup page', observation: first.observation});
+    const opened = await settle();
+    assert.equal(opened.tabs.length, 2);
+    const popup = opened.tabs.find(tab => tab.id !== first.tab);
+    assert.equal(opened.activeId, popup.id);
+    assert.match(popup.url, /\/next$/);
+    const live = await browsers.session('tab-session');
+    await live.tabs.find(tab => tab.id === popup.id).page.waitForLoadState('domcontentloaded').catch(() => {});
+    assert.equal((await run({action: 'snapshot'})).url, `${base}/next`);
+
+    // Switching tabs re-points the pane and invalidates the older observation.
+    const switched = await run({action: '_tabs', op: 'select', tab: first.tab});
+    assert.equal(switched.activeId, first.tab);
+    assert.equal((await run({action: 'evaluate', expression: 'title'})).result, 'First');
+    await assert.rejects(run({action: '_tabs', op: 'select', tab: 'tab-404'}), /BROWSER_UNKNOWN_TAB/);
+    await assert.rejects(run({action: 'click', role: 'link', name: 'Next page', observation: first.observation}), /STALE/);
+
+    // Each tab keeps its own history, so back and forward report what is left.
+    await run({action: 'navigate', url: `${base}/next`});
+    const arrived = await run({action: '_view'});
+    assert.equal(arrived.canGoBack, true);
+    assert.equal(arrived.canGoForward, false);
+    await run({action: '_back'});
+    const rewound = await run({action: '_view'});
+    assert.equal(rewound.url, `${base}/`);
+    assert.equal(rewound.canGoForward, true);
+    await run({action: '_forward'});
+    const replayed = await run({action: '_view'});
+    assert.equal(replayed.url, `${base}/next`);
+    assert.equal(replayed.canGoForward, false);
+
+    // Closing a tab leaves the pane on its neighbour.
+    const closed = await run({action: '_tabs', op: 'close', tab: first.tab});
+    assert.equal(closed.tabs.length, 1);
+    assert.equal(closed.activeId, popup.id);
+
+    // Stop answers while a slow load is still in flight, the way a browser's
+    // own stop button does, and reports the load as finished.
+    const slow = run({action: 'navigate', url: `${base}/slow`}).catch(error => error);
+    await new Promise(resolve => setTimeout(resolve, 400));
+    assert.equal((await run({action: '_stop'})).stopped, true);
+    assert.equal((await run({action: '_view'})).loading, false);
+    await slow;
+
+    // Copying from the pane reads the page's own selection.
+    await run({action: 'navigate', url: base});
+    await live.page.evaluate(() => {
+      const range = document.createRange();
+      range.selectNodeContents(document.querySelector('#line'));
+      const selection = window.getSelection();
+      selection.removeAllRanges();
+      selection.addRange(range);
+    });
+    assert.equal((await run({action: '_selection'})).text, 'Selectable line');
+
+    // A brand new tab is blank and becomes the tab the pane shows.
+    const created = await run({action: '_tabs', op: 'new'});
+    assert.equal(created.tabs.length, 2);
+    assert.equal(created.activeId, created.tabs[created.tabs.length - 1].id);
+    assert.equal((await run({action: '_view'})).url, 'about:blank');
+  } finally { await browsers.dispose(); await new Promise(resolve => server.close(resolve)); }
 });

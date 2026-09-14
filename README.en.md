@@ -4,8 +4,9 @@
 
 - The `browser` tool runs Playwright Chromium in a Session-scoped context for automation, accessibility snapshots, and screenshots.
 - The `Browser` page in the Web right Sidebar uses the official Sidebar extension API to stream that same page live and forward pointer, keyboard, navigation, and scroll input.
+- The pane is organized like a real browser: a tab strip, Back and Forward, Stop, an address bar, a tools menu, and a context menu, with tab count and load state following the Agent's actions.
 - The stream carries operation cues: Agent actions leave a mouse pointer with a caption, hovering outlines the element with its role and name, a focused field shows an outline and caret, and typed text echoes briefly.
-- The page reflows to the Sidebar's own size. Click, drag, scroll, double-click to select, paste, use an IME, and press Tab, arrows, or paging keys directly on the frame.
+- Layout switches between a desktop viewport and the Sidebar width, with zoom steps. Click, drag, scroll, double-click to select, paste, use an IME, and press Tab, arrows, or paging keys directly on the frame.
 
 The tool and Sidebar share cookies, storage, login state, and page history. Host automation remains headless by default while the Sidebar provides the visible surface. Enter passwords and MFA codes manually in the Sidebar; the tool never exports credentials.
 
@@ -14,6 +15,10 @@ The tool and Sidebar share cookies, storage, login state, and page history. Host
 ![Browser page in the right Sidebar](docs/screenshots/right-sidebar-browser.png)
 
 Figure: validation capture of a local fixture page inside the DSH Web right Sidebar, showing the focus outline, element caption, typed-text echo, and mouse pointer; see [`docs/screenshots/SOURCES.md`](docs/screenshots/SOURCES.md) for provenance and validation boundaries.
+
+![Tab strip and tools menu of the right Sidebar browser](docs/screenshots/right-sidebar-browser-tabs.png)
+
+Figure: the same pane with its tab strip, Back and Forward state, address bar, and the tools menu carrying the zoom steps and the `Fit Sidebar width` option.
 
 ## Install
 
@@ -47,14 +52,16 @@ After the Web client extension is installed, the right Sidebar registers a `Brow
 
 1. Open the Harness Web right Sidebar and select `Browser`. A tool navigation opens it automatically.
 2. Enter an HTTP(S) address in the address bar and press Enter; a tool navigation drives the same page.
-3. Use Back, Forward, Reload, and Close. Click the frame to operate the page: the clicked point shows a ripple and pointer, and a focused field shows its outline and caret.
-4. Typing reaches the focused element; paste, drag, and scroll work the same way. While the Agent acts, the frame shows where it clicked or typed and labels the operation.
+3. Manage pages in the tab strip: `+` opens a tab, a tab click switches, and `×` closes. A window the site opens becomes a managed tab instead of being lost.
+4. Back and Forward enable or disable from the active tab's history; while a page loads the reload button becomes Stop, which ends a slow load. Click the frame to operate the page: the clicked point shows a ripple and pointer, and a focused field shows its outline and caret.
+5. Typing reaches the focused element; paste, drag, and scroll work the same way. `Ctrl/Cmd+C` copies the page selection into the system clipboard, and the context menu offers Copy, Paste, and Select All. While the Agent acts, the frame shows where it clicked or typed and labels the operation.
+6. The `⋯` menu switches between `Desktop layout (1280 wide)` and `Fit Sidebar width` and offers Zoom In, Zoom Out, and Reset to 100%. Desktop layout keeps the page as a wide screen renders it; fitting the Sidebar uses the Sidebar width as the page width, which suits reading in a narrow pane.
 
-The page accepts credential-free HTTP(S) addresses and streams Chromium through the authenticated Host interface, including sites that deny iframe embedding. Frames arrive as CDP events, so a still page costs no traffic and actions update immediately; when the stream is unavailable the pane falls back to one-shot captures, marks the toolbar `Compatibility view`, and keeps retrying. User input invalidates the tool observation; take another snapshot before tool input. Audio/video streaming, clipboard reading, and downloads are unavailable.
+The page accepts credential-free HTTP(S) addresses and streams Chromium through the authenticated Host interface, including sites that deny iframe embedding. Frames arrive as CDP events, so a still page costs no traffic and actions update immediately; a two-second heartbeat reports whether frames are still produced, and the pane marks the picture paused once they stop. When the stream is unavailable the pane falls back to one-shot captures, marks the toolbar `Compatibility view`, and keeps retrying. Human input is stored as a fraction of the picture, so a layout or zoom change never moves a click elsewhere. User input invalidates the tool observation; take another snapshot before tool input. Audio/video streaming, downloads, and credential export are unavailable.
 
 ## The `browser` tool
 
-Supported actions are `navigate`, `snapshot`, `screenshot`, `click`, `fill`, `press`, `scroll`, `console`, `evaluate`, and `close`.
+Supported actions are `navigate`, `snapshot`, `screenshot`, `click`, `fill`, `press`, `scroll`, `tabs`, `console`, `evaluate`, and `close`. `tabs` takes an `op` of `list`, `new`, `select`, or `close` plus a `tab` id; `list` is a pure read, while switching or closing a tab invalidates the older observation.
 
 Navigate or take a snapshot first, then pass the latest `observation` plus the exact accessible `role` and `name` to an input action. Re-observe after a page change. A purely visual target with no accessible name can be clicked at its observed coordinates:
 
@@ -98,7 +105,7 @@ npm test
 BROWSER_TEST_EXECUTABLE=/path/to/chrome npm test
 ```
 
-The tests start a local HTTP fixture and cover navigation, form input, stale-observation rejection, console output, screenshots, fixed inspections, Session isolation, and the Sidebar stream with its frame, pointer, focus, drag, and coordinate-click events. Harness Web Sidebar activation and native attachment rendering are separate integration checks; see [`docs/e2e.md`](docs/e2e.md).
+The tests start a local HTTP fixture and cover navigation, form input, stale-observation rejection, console output, screenshots, fixed inspections, Session isolation, and the Sidebar stream with its frame, pointer, focus, drag, and coordinate-click events. The same suite covers opening, switching, and closing tabs, a site popup becoming a tab, history state for Back and Forward, stopping a slow load, and reading the page selection. Harness Web Sidebar activation and native attachment rendering are separate integration checks; see [`docs/e2e.md`](docs/e2e.md).
 
 ## Development docs
 

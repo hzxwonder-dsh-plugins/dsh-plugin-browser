@@ -20,6 +20,12 @@ window.__ModuleLoader__.load({
     const POLL_MS = 900;
     const STREAM_RETRY_MS = 1500;
     const STREAM_REATTACH_POLLS = 12;
+    /** Zoom steps a real browser offers, applied to the layout width. */
+    const ZOOM_STEPS = [0.5, 0.67, 0.8, 0.9, 1, 1.1, 1.25, 1.5, 1.75, 2];
+    /** Logical width of the desktop layout the pane asks the Host for. */
+    const DESKTOP_WIDTH = 1280;
+    /** How long a picture may stand still before the pane says so. */
+    const STALE_MS = 2500;
     const COPY = {
       en: {
         "browser": "Browser",
@@ -51,6 +57,7 @@ window.__ModuleLoader__.load({
         "err.input": "That interaction is not supported.",
         "err.action": "That action is not available from the Sidebar.",
         "err.invalid": "Enter a valid HTTP(S) URL, for example https://example.com.",
+        "err.tab": "That tab no longer exists.",
         "agentClick": "Agent click",
         "agentFill": "Agent input",
         "agentPress": "Agent key",
@@ -61,6 +68,26 @@ window.__ModuleLoader__.load({
         "humanDrag": "Your drag",
         "humanScroll": "Your scroll",
         "typing": "Typing",
+        "tabs": "Page tabs",
+        "newTab": "New tab",
+        "closeTab": "Close tab",
+        "tabBlank": "New tab",
+        "stop": "Stop loading",
+        "tools": "Browser menu",
+        "zoomIn": "Zoom in",
+        "zoomOut": "Zoom out",
+        "zoomReset": "Reset zoom to 100%",
+        "layoutDesktop": "Desktop layout (1280 wide)",
+        "layoutFit": "Fit the pane width",
+        "desktop": "Desktop",
+        "fit": "Fit",
+        "copy": "Copy",
+        "paste": "Paste",
+        "selectAll": "Select all",
+        "copied": "Copied {n} characters",
+        "copyEmpty": "Nothing is selected on the page",
+        "pasteHint": "The clipboard could not be read. Press Ctrl+V in the page.",
+        "stale": "Picture paused",
       },
       zh: {
         "browser": "浏览器",
@@ -92,6 +119,7 @@ window.__ModuleLoader__.load({
         "err.input": "不支持该交互方式。",
         "err.action": "侧栏不支持该操作。",
         "err.invalid": "请输入有效的 HTTP(S) 网址，例如 https://example.com。",
+        "err.tab": "该标签页已不存在。",
         "agentClick": "Agent 点击",
         "agentFill": "Agent 输入",
         "agentPress": "Agent 按键",
@@ -102,6 +130,26 @@ window.__ModuleLoader__.load({
         "humanDrag": "你的拖拽",
         "humanScroll": "你的滚动",
         "typing": "正在输入",
+        "tabs": "标签页",
+        "newTab": "新建标签页",
+        "closeTab": "关闭标签页",
+        "tabBlank": "新标签页",
+        "stop": "停止加载",
+        "tools": "浏览器菜单",
+        "zoomIn": "放大",
+        "zoomOut": "缩小",
+        "zoomReset": "恢复 100%",
+        "layoutDesktop": "桌面布局（宽 1280）",
+        "layoutFit": "适配侧栏宽度",
+        "desktop": "桌面",
+        "fit": "适配",
+        "copy": "复制",
+        "paste": "粘贴",
+        "selectAll": "全选",
+        "copied": "已复制 {n} 个字符",
+        "copyEmpty": "页面上没有选中内容",
+        "pasteHint": "无法读取剪贴板，请在页面里按 Ctrl+V。",
+        "stale": "画面已暂停",
       },
     };
     const ERROR_KEYS = {
@@ -119,12 +167,15 @@ window.__ModuleLoader__.load({
       BROWSER_INVALID_ACTION: "err.action",
       BROWSER_INVALID_URL: "err.invalid",
       BROWSER_HTTP_URL_REQUIRED: "err.invalid",
+      BROWSER_UNKNOWN_TAB: "err.tab",
     };
     const AGENT_LABELS = {click: "agentClick", fill: "agentFill", press: "agentPress", scroll: "agentScroll", drag: "agentDrag", navigate: "agentNavigate"};
     const HUMAN_LABELS = {click: "humanClick", drag: "humanDrag", scroll: "humanScroll"};
     /** Keys the Host forwards, spelled exactly as the Host validates them. */
     const PLAIN_KEYS = ["Enter", "Tab", "Escape", "Backspace", "Delete", "Insert", "ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown", "Home", "End", "PageUp", "PageDown", "F5"];
     const COMBO_KEYS = {a: "Ctrl+A", c: "Ctrl+C", v: "Ctrl+V", x: "Ctrl+X", z: "Ctrl+Z", f: "Ctrl+F", l: "Ctrl+L"};
+    /** Input that comes from the person in front of the picture. */
+    const HUMAN_INPUT = new Set(["click", "drag", "scroll", "text", "key"]);
 
     function httpUrl(input) {
       let url;
@@ -133,18 +184,15 @@ window.__ModuleLoader__.load({
       return url.href;
     }
 
+    /** What a tab strip calls one tab: the site, or a placeholder while blank. */
+    function tabLabel(url, blank) {
+      if (!url || url === "about:blank") return blank;
+      try { return new URL(url).host || url; } catch { return url; }
+    }
+
     function errorKey(error) {
       const code = /^BROWSER_[A-Z_]+/.exec(String(error?.message ?? error))?.[0];
       return ERROR_KEYS[code] ?? "err.request";
-    }
-
-    /** Map one pointer position inside the stage into page viewport coordinates. */
-    function toPage(event, element, viewport) {
-      const rect = element.getBoundingClientRect();
-      return {
-        x: (event.clientX - rect.left) * viewport.width / rect.width,
-        y: (event.clientY - rect.top) * viewport.height / rect.height,
-      };
     }
 
     function decodeBase64(value) {
@@ -323,13 +371,24 @@ window.__ModuleLoader__.load({
     function BrowserBody({useTabInfo, sessionId, t}) {
       const {tab} = useTabInfo();
       const visible = tab.visible;
-      const copy = React.useCallback((key, params) => t?.(key, params) ?? COPY.en[key] ?? key, [t]);
+      const copy = React.useCallback((key, params) => {
+        const text = t?.(key, params) ?? COPY.en[key] ?? key;
+        return params ? Object.entries(params).reduce((line, [name, value]) => line.replace(`{${name}}`, String(value)), text) : text;
+      }, [t]);
       const [address, setAddress] = React.useState("");
       const [active, setActive] = React.useState(false);
       const [loading, setLoading] = React.useState(false);
       const [mode, setMode] = React.useState("stream");
       const [error, setError] = React.useState("");
       const [size, setSize] = React.useState(undefined);
+      const [tabs, setTabs] = React.useState([]);
+      const [nav, setNav] = React.useState({canGoBack: false, canGoForward: false});
+      const [zoom, setZoom] = React.useState(1);
+      const [desktop, setDesktop] = React.useState(true);
+      const [view, setView] = React.useState({width: 0, height: 0, scale: 1});
+      const [menu, setMenu] = React.useState(undefined);
+      const [note, setNote] = React.useState("");
+      const [stale, setStale] = React.useState(false);
       const stage = React.useRef(null);
       const surface = React.useRef(null);
       const overlay = React.useRef(null);
@@ -358,8 +417,20 @@ window.__ModuleLoader__.load({
       const wheelPoint = React.useRef(undefined);
       const wheelTimer = React.useRef(0);
       const polls = React.useRef(0);
+      const beat = React.useRef({at: 0, off: 0});
+      const noteTimer = React.useRef(0);
+      const layout = React.useRef({zoom: 1, desktop: true});
+      layout.current = {zoom, desktop};
       const endpoint = `/api/dsh-browser?sessionId=${encodeURIComponent(sessionId)}`;
       const streamEndpoint = `/api/dsh-browser/stream?sessionId=${encodeURIComponent(sessionId)}`;
+
+      /** Show a short-lived hint inside the pane, the way a browser shows toast
+       * confirmations for copying and clipboard failures. */
+      const flash = React.useCallback(text => {
+        setNote(text);
+        clearTimeout(noteTimer.current);
+        noteTimer.current = setTimeout(() => setNote(""), 2200);
+      }, []);
 
       const paint = React.useCallback(() => {
         if (overlay.current) {
@@ -419,21 +490,39 @@ window.__ModuleLoader__.load({
       }, [paint]);
 
       const handleEvent = React.useCallback(event => {
+        // Events carry the counter they were produced with, so the pane never
+        // sends input against a page that has already moved past it.
+        if (event.observation) observation.current = Math.max(observation.current, event.observation);
         if (event.t === "hello") {
           if (event.viewport) viewport.current = event.viewport;
+          if (event.tabs) { setTabs(event.tabs); }
+          setNav({canGoBack: Boolean(event.canGoBack), canGoForward: Boolean(event.canGoForward)});
           setActive(event.active !== false);
           if (event.url && !editing.current) setAddress(event.url === "about:blank" ? "" : event.url);
+          return;
+        }
+        if (event.t === "tabs") {
+          setTabs(event.tabs ?? []);
           return;
         }
         if (event.t === "state") {
           if (event.active === false) { setActive(false); return; }
           setActive(true);
-          if (event.observation) observation.current = event.observation;
           if (event.url && !editing.current) setAddress(event.url === "about:blank" ? "" : event.url);
+          if (event.tabs) setTabs(event.tabs);
+          if (event.loading !== undefined) setLoading(Boolean(event.loading));
+          if (event.canGoBack !== undefined) setNav({canGoBack: Boolean(event.canGoBack), canGoForward: Boolean(event.canGoForward)});
+          return;
+        }
+        if (event.t === "tick") {
+          // The Host's beat separates "nothing changed on the page" from "the
+          // picture stopped coming", which are very different for a human.
+          beat.current = {at: performance.now(), off: event.screencast === false ? beat.current.off + 1 : 0};
           return;
         }
         if (event.t === "frame") {
           if (event.viewport) viewport.current = event.viewport;
+          beat.current = {at: performance.now(), off: 0};
           setActive(true);
           drawFrame(event.data);
           return;
@@ -514,9 +603,13 @@ window.__ModuleLoader__.load({
             if (!response.ok) throw new Error(value.error || "BROWSER_REQUEST_FAILED");
             setActive(value.active);
             if (!value.active) { setLoading(false); return; }
-            observation.current = value.observation;
+            observation.current = Math.max(observation.current, value.observation);
             if (!editing.current) setAddress(value.url === "about:blank" ? "" : value.url);
+            if (value.tabs) setTabs(value.tabs);
+            if (value.loading !== undefined) setLoading(Boolean(value.loading));
+            if (value.canGoBack !== undefined) setNav({canGoBack: Boolean(value.canGoBack), canGoForward: Boolean(value.canGoForward)});
             viewport.current = {width: value.width, height: value.height};
+            beat.current = {at: performance.now(), off: 0};
             drawFrame(value.image);
             setLoading(false);
           } catch (failure) {
@@ -532,40 +625,102 @@ window.__ModuleLoader__.load({
         return () => { controller.abort(); clearTimeout(timer); };
       }, [visible, sessionId, size, mode, endpoint, copy, drawFrame]);
 
-      // Follow the Sidebar's own size: the page reflows to the width and height
-      // the human gave the pane, and the Host restarts its screencast.
+      // The pane decides the page's logical viewport: the desktop layout keeps a
+      // fixed width so sites do not reflow into a phone layout in a narrow
+      // Sidebar, zoom trades layout width for readable type, and the picture is
+      // scaled proportionally into whatever room the stage has.
       React.useEffect(() => {
         const element = stage.current;
         if (!element || !visible) return undefined;
         let timer;
         const measure = () => {
-          const width = Math.max(240, Math.min(1920, Math.round(element.clientWidth)));
-          const height = Math.max(200, Math.min(1600, Math.round(element.clientHeight)));
-          if (width <= 0 || height <= 0) return;
+          const room = Math.max(240, Math.min(1920, Math.round(element.clientWidth)));
+          const roomHeight = Math.max(200, Math.min(1600, Math.round(element.clientHeight)));
+          if (room <= 0 || roomHeight <= 0) return;
+          const {zoom: factor, desktop: wantsDesktop} = layout.current;
+          const logicalWidth = Math.max(240, Math.min(1920, Math.round((wantsDesktop ? DESKTOP_WIDTH : room) / factor)));
+          const scale = room / logicalWidth;
+          const logicalHeight = Math.max(200, Math.min(1600, Math.round(roomHeight / scale)));
+          const fitted = Math.min(room / logicalWidth, roomHeight / logicalHeight);
+          setView({width: Math.round(logicalWidth * fitted), height: Math.round(logicalHeight * fitted), scale});
           if (overlay.current && overlay.current.width === 0) {
-            overlay.current.width = width * 2;
-            overlay.current.height = height * 2;
+            overlay.current.width = logicalWidth * 2;
+            overlay.current.height = logicalHeight * 2;
           }
-          setSize(previous => previous && previous.width === width && previous.height === height ? previous : {width, height});
+          setSize(previous => previous && previous.width === logicalWidth && previous.height === logicalHeight ? previous : {width: logicalWidth, height: logicalHeight});
         };
         const observer = new ResizeObserver(() => { clearTimeout(timer); timer = setTimeout(measure, RESIZE_SETTLE_MS); });
         observer.observe(element);
         measure();
         return () => { clearTimeout(timer); observer.disconnect(); };
-      }, [visible]);
+      }, [visible, zoom, desktop]);
 
+      // A stream that goes quiet, or one the Host reports as no longer sending
+      // frames, is worth saying out loud; a page that simply stopped changing
+      // is not, so the Host's beat decides.
+      React.useEffect(() => {
+        if (!visible || !active) { setStale(false); return undefined; }
+        const timer = setInterval(() => {
+          const quiet = beat.current.at > 0 && performance.now() - beat.current.at > STALE_MS * 2;
+          setStale(quiet || beat.current.off >= 3);
+        }, 1000);
+        return () => clearInterval(timer);
+      }, [visible, active]);
+
+      const post = async args => {
+        const response = await fetch(endpoint, {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify(args)});
+        const value = await response.json().catch(() => ({}));
+        if (!response.ok) throw new Error(value.error || "BROWSER_REQUEST_FAILED");
+        return value;
+      };
+      /** Remember a pane point as a fraction of the picture the human saw. */
+      const asFraction = point => ({
+        fx: point.x / Math.max(1, viewport.current.width), fy: point.y / Math.max(1, viewport.current.height),
+      });
+      /** Turn remembered fractions into the page coordinates of one viewport. */
+      const materialize = (args, size) => {
+        if (args.action !== "_input" || !size?.width || !size?.height) return args;
+        const at = point => ({
+          x: Math.min(size.width - 1, Math.max(0, Math.round(point.fx * size.width))),
+          y: Math.min(size.height - 1, Math.max(0, Math.round(point.fy * size.height))),
+        });
+        if (args.kind === "click") return {...args, width: size.width, height: size.height, ...at(args.point)};
+        if (args.kind === "drag") return {...args, from: at(args.from), to: at(args.to)};
+        if (args.kind === "scroll" && args.point) return {...args, ...at(args.point)};
+        return args;
+      };
       const send = args => {
-        setLoading(args.action === "navigate");
+        if (args.action === "navigate") setLoading(true);
         queue.current = queue.current.catch(() => {}).then(async () => {
-          const response = await fetch(endpoint, {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify(args)});
-          const value = await response.json().catch(() => ({}));
-          if (!response.ok) throw new Error(value.error || "BROWSER_REQUEST_FAILED");
-          if (value.observation) observation.current = value.observation;
+          // The counter is read when the request leaves, not when the human
+          // pressed the key: queued keystrokes would otherwise carry a value
+          // the page has already moved past.
+          const request = args.observation === undefined ? args : {...args, observation: observation.current};
+          let value;
+          try {
+            value = await post(materialize(request, viewport.current));
+          } catch (failure) {
+            const code = errorKey(failure);
+            // The human clicks the picture in front of them, so a bookkeeping
+            // mismatch is re-read and repeated once instead of being refused.
+            if (code !== "err.stale" || !HUMAN_INPUT.has(args.action === "_input" ? args.kind : args.action)) { setError(copy(code)); return; }
+            const fresh = await post({action: "_view"}).catch(() => undefined);
+            const now = fresh?.observation ? {width: fresh.width, height: fresh.height} : undefined;
+            if (!now) { setError(copy(code)); return; }
+            observation.current = fresh.observation;
+            viewport.current = now;
+            try { value = await post(materialize({...request, observation: fresh.observation}, now)); }
+            catch (again) { setError(copy(errorKey(again))); return; }
+          }
+          if (value.observation) observation.current = Math.max(observation.current, value.observation);
+          if (value.tabs) setTabs(value.tabs);
+          if (value.loading !== undefined) setLoading(Boolean(value.loading));
+          if (value.canGoBack !== undefined) setNav({canGoBack: Boolean(value.canGoBack), canGoForward: Boolean(value.canGoForward)});
           setError("");
-          if (args.action === "navigate" || args.action === "_reload" || args.kind === "click") polls.current = 0;
+          if (args.action === "navigate" || args.action === "_reload" || args.action === "_tabs" || args.kind === "click") polls.current = 0;
           return value;
         }).catch(failure => { setError(copy(errorKey(failure))); })
-          .finally(() => setLoading(false));
+          .finally(() => { if (args.action === "navigate") setLoading(false); });
       };
 
       // Hover probes are pure reads: they never consume an observation and never
@@ -598,6 +753,30 @@ window.__ModuleLoader__.load({
         type: "button", className: "dsh-browser-action", title: label, "aria-label": label,
         "data-dsh-browser-action": action, onClick: () => { setError(""); send({action}); },
       }, glyph);
+      /** History buttons mirror a real browser: unavailable moves are disabled. */
+      const navButton = (label, glyph, action, disabled) => React.createElement("button", {
+        type: "button", className: "dsh-browser-action", title: label, "aria-label": label,
+        "data-dsh-browser-action": action, disabled: disabled ? true : undefined,
+        onClick: () => { setError(""); send({action}); },
+      }, glyph);
+      const menuItem = (label, onSelect, options = {}) => React.createElement("button", {
+        key: options.id ?? label, type: "button", role: "menuitem", className: "dsh-browser-menu-item",
+        "data-dsh-browser-menu-item": options.id, disabled: options.disabled ? true : undefined,
+        onClick: event => { event.stopPropagation(); onSelect(); },
+      },
+        React.createElement("span", {className: "dsh-browser-menu-label"}, label),
+        options.checked ? React.createElement("span", {className: "dsh-browser-menu-check", "aria-hidden": "true"}, "\u2713") : null
+      );
+      /** Map a pane event onto page coordinates, ignoring the letterbox area. */
+      const toPagePoint = (event, element) => {
+        if (!element) return undefined;
+        const rect = element.getBoundingClientRect();
+        if (!rect.width || !rect.height) return undefined;
+        const x = (event.clientX - rect.left) * viewport.current.width / rect.width;
+        const y = (event.clientY - rect.top) * viewport.current.height / rect.height;
+        if (x < 0 || y < 0 || x >= viewport.current.width || y >= viewport.current.height) return undefined;
+        return {x, y};
+      };
       const navigate = () => {
         try {
           const target = httpUrl(address.trim());
@@ -608,8 +787,42 @@ window.__ModuleLoader__.load({
           send({action: "navigate", url: target});
         } catch { setError(copy("err.invalid")); }
       };
+      /** Copy the page's own selection into the human's clipboard. */
+      const copySelection = async () => {
+        setMenu(undefined);
+        try {
+          const response = await fetch(endpoint, {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify({action: "_selection"})});
+          const value = await response.json().catch(() => ({}));
+          if (!response.ok) throw new Error(value.error || "BROWSER_REQUEST_FAILED");
+          const text = String(value.text ?? "").trim();
+          if (!text) { flash(copy("copyEmpty")); return; }
+          await navigator.clipboard.writeText(text);
+          flash(copy("copied", {n: text.length}));
+        } catch { flash(copy("err.request")); }
+      };
+      const pasteClipboard = async () => {
+        setMenu(undefined);
+        keyboard.current?.focus({preventScroll: true});
+        try {
+          const text = await navigator.clipboard.readText();
+          if (text) send({action: "_input", kind: "text", text, observation: observation.current});
+        } catch { flash(copy("pasteHint")); }
+      };
+      const stepZoom = direction => {
+        const index = Math.max(0, ZOOM_STEPS.indexOf(zoom));
+        setZoom(ZOOM_STEPS[Math.max(0, Math.min(ZOOM_STEPS.length - 1, index + direction))]);
+      };
+      const tabAction = (op, id) => send({action: "_tabs", op, ...(id ? {tab: id} : {})});
       const onKeyDown = event => {
         if (composing.current || event.nativeEvent?.isComposing) return;
+        // Escape closes the pane's own menu first, exactly like a browser menu.
+        if (event.key === "Escape" && menu) { event.preventDefault(); setMenu(undefined); return; }
+        if (event.metaKey || event.ctrlKey) {
+          const key = event.key;
+          if (key === "+" || key === "=" || key === "-" || key === "_") { event.preventDefault(); stepZoom(key === "-" || key === "_" ? -1 : 1); return; }
+          if (key === "0") { event.preventDefault(); setZoom(1); return; }
+          if (key.toLowerCase() === "c") { event.preventDefault(); void copySelection(); return; }
+        }
         const combo = (event.metaKey || event.ctrlKey) ? COMBO_KEYS[event.key.toLowerCase()] : undefined;
         if (combo) {
           // Paste stays local: the composition field already holds the text.
@@ -628,10 +841,34 @@ window.__ModuleLoader__.load({
 
       const empty = !active;
       return React.createElement("div", {className: "dsh-browser-body", "data-dsh-browser": "body"},
+        React.createElement("div", {className: "dsh-browser-tabs", role: "tablist", "aria-label": copy("tabs"), "data-dsh-browser": "tabs"},
+          tabs.map(entry => React.createElement("div", {
+            key: entry.id, className: "dsh-browser-tab", "data-dsh-browser-tab": entry.id,
+            "data-active": entry.active ? "true" : undefined, role: "tab", "aria-selected": entry.active ? "true" : "false",
+          },
+            React.createElement("button", {
+              type: "button", className: "dsh-browser-tab-label", title: entry.url || copy("tabBlank"),
+              onClick: () => { if (!entry.active) tabAction("select", entry.id); },
+            }, entry.loading ? React.createElement("span", {className: "dsh-browser-tab-spin", "aria-hidden": "true"}, "\u25cc") : null, tabLabel(entry.url, copy("tabBlank"))),
+            tabs.length > 1 && React.createElement("button", {
+              type: "button", className: "dsh-browser-tab-close", title: copy("closeTab"), "aria-label": copy("closeTab"),
+              onClick: () => tabAction("close", entry.id),
+            }, "\u00d7")
+          )),
+          React.createElement("button", {
+            type: "button", className: "dsh-browser-tab-new", title: copy("newTab"), "aria-label": copy("newTab"),
+            "data-dsh-browser-action": "new-tab", onClick: () => tabAction("new"),
+          }, "+")
+        ),
         React.createElement("div", {className: "dsh-browser-toolbar"},
-          iconButton(copy("back"), "\u2190", "_back"),
-          iconButton(copy("forward"), "\u2192", "_forward"),
-          iconButton(copy("reload"), "\u21bb", "_reload"),
+          navButton(copy("back"), "\u2190", "_back", !nav.canGoBack),
+          navButton(copy("forward"), "\u2192", "_forward", !nav.canGoForward),
+          loading
+            ? React.createElement("button", {
+                type: "button", className: "dsh-browser-action", title: copy("stop"), "aria-label": copy("stop"),
+                "data-dsh-browser-action": "_stop", onClick: () => send({action: "_stop"}),
+              }, "\u25a0")
+            : iconButton(copy("reload"), "\u21bb", "_reload"),
           React.createElement("input", {
             ref: addressField, className: "dsh-browser-address", value: address,
             onChange: event => setAddress(event.target.value),
@@ -640,17 +877,27 @@ window.__ModuleLoader__.load({
             onKeyDown: event => { event.stopPropagation(); if (event.key === "Enter") navigate(); },
             spellCheck: false, inputMode: "url", "aria-label": copy("address"), placeholder: "https://",
           }),
-          React.createElement("button", {type: "button", className: "dsh-browser-action", title: copy("go"), "aria-label": copy("go"), onClick: navigate}, loading ? "\u22ef" : "\u21b5"),
+          React.createElement("button", {type: "button", className: "dsh-browser-action", title: copy("go"), "aria-label": copy("go"), onClick: navigate}, "\u21b5"),
+          React.createElement("button", {
+            type: "button", className: "dsh-browser-action", title: copy("tools"), "aria-label": copy("tools"),
+            "data-dsh-browser-action": "menu", "aria-expanded": menu?.kind === "tools" ? "true" : "false",
+            onClick: event => { event.stopPropagation(); setMenu(menu?.kind === "tools" ? undefined : {kind: "tools"}); },
+          }, "\u22ef"),
           mode !== "stream" && React.createElement("span", {className: "dsh-browser-note", "data-dsh-browser-mode": mode}, copy("polling")),
           iconButton(copy("close"), "\u00d7", "close")
         ),
         error && React.createElement("div", {className: "dsh-browser-error", role: "alert"}, error),
         React.createElement("div", {className: "dsh-browser-stage", ref: stage, "data-dsh-browser": "stage"},
-          React.createElement("canvas", {
-            ref: surface, className: "dsh-browser-frame", "data-dsh-browser": "frame",
-            "aria-label": copy("page"), style: {visibility: empty ? "hidden" : "visible"},
-          }),
-          React.createElement("canvas", {ref: overlay, className: "dsh-browser-overlay", "aria-hidden": "true"}),
+          React.createElement("div", {
+            className: "dsh-browser-view", "data-dsh-browser": "view",
+            style: view.width ? {width: `${view.width}px`, height: `${view.height}px`} : undefined,
+          },
+            React.createElement("canvas", {
+              ref: surface, className: "dsh-browser-frame", "data-dsh-browser": "frame",
+              "aria-label": copy("page"), style: {visibility: empty ? "hidden" : "visible"},
+            }),
+            React.createElement("canvas", {ref: overlay, className: "dsh-browser-overlay", "aria-hidden": "true"})
+          ),
           React.createElement("textarea", {
             ref: keyboard, className: "dsh-browser-keyboard", "aria-label": copy("keyboard"),
             "data-dsh-browser": "keyboard", autoComplete: "off", spellCheck: false,
@@ -670,51 +917,86 @@ window.__ModuleLoader__.load({
             onMouseDown: event => { event.preventDefault(); keyboard.current?.focus({preventScroll: true}); },
             onPointerDown: event => {
               if (empty) return;
-              drag.current = {from: toPage(event, event.currentTarget, viewport.current), to: undefined};
+              const point = toPagePoint(event, surface.current);
+              if (point) drag.current = {from: asFraction(point), origin: point, to: undefined};
             },
             onMouseMove: event => {
               if (empty) return;
-              const point = toPage(event, event.currentTarget, viewport.current);
+              const point = toPagePoint(event, surface.current);
+              if (!point) { hoverLive.current = false; hover.current = undefined; hoverPoint.current = undefined; return; }
               hoverLive.current = true;
               probeHover(point.x, point.y);
-              if (drag.current) drag.current.to = point;
+              if (drag.current) drag.current.to = asFraction(point);
             },
             onMouseLeave: () => { hoverLive.current = false; hover.current = undefined; hoverPoint.current = undefined; },
             onMouseUp: event => {
               const current = drag.current;
               drag.current = undefined;
-              if (!current || empty) return;
-              const point = toPage(event, event.currentTarget, viewport.current);
-              if (Math.hypot(point.x - current.from.x, point.y - current.from.y) < 6) return;
+              if (!current || empty || !current.to) return;
+              const point = toPagePoint(event, surface.current);
+              if (!point || Math.hypot(point.x - current.origin.x, point.y - current.origin.y) < 6) return;
               // A real drag is not also a click.
               swallowClick.current = true;
-              send({action: "_input", kind: "drag", from: current.from, to: point, observation: observation.current});
+              send({action: "_input", kind: "drag", from: current.from, to: current.to, observation: observation.current});
             },
             onClick: event => {
+              if (menu) { setMenu(undefined); swallowClick.current = false; return; }
               if (swallowClick.current) { swallowClick.current = false; return; }
               if (empty) return;
+              const point = toPagePoint(event, surface.current);
+              if (!point) return;
               event.stopPropagation();
-              const point = toPage(event, event.currentTarget, viewport.current);
               ripple.current = {x: point.x, y: point.y, at: performance.now()};
               send({
-                action: "_input", kind: "click", width: viewport.current.width, height: viewport.current.height,
-                clickCount: Math.max(1, Math.min(3, event.detail || 1)), x: point.x, y: point.y, observation: observation.current,
+                action: "_input", kind: "click", point: asFraction(point),
+                clickCount: Math.max(1, Math.min(3, event.detail || 1)), observation: observation.current,
               });
+            },
+            onContextMenu: event => {
+              event.preventDefault();
+              if (empty) return;
+              const rect = event.currentTarget.getBoundingClientRect();
+              setMenu({kind: "page", x: Math.max(4, event.clientX - rect.left), y: Math.max(4, event.clientY - rect.top)});
             },
             onWheel: event => {
               if (empty) return;
+              const point = toPagePoint(event, surface.current);
+              if (!point) return;
               wheelDelta.current += event.deltaY;
-              wheelPoint.current = toPage(event, event.currentTarget, viewport.current);
+              wheelPoint.current = asFraction(point);
               if (wheelTimer.current) return;
               wheelTimer.current = window.setTimeout(() => {
                 wheelTimer.current = 0;
                 const deltaY = Math.max(-1200, Math.min(1200, Math.round(wheelDelta.current)));
                 wheelDelta.current = 0;
                 if (deltaY === 0) return;
-                send({action: "_input", kind: "scroll", deltaY, x: wheelPoint.current?.x, y: wheelPoint.current?.y, observation: observation.current});
+                send({action: "_input", kind: "scroll", deltaY, point: wheelPoint.current, observation: observation.current});
               }, WHEEL_FLUSH_MS);
             },
           }),
+          menu && React.createElement("div", {
+            className: "dsh-browser-menu", role: "menu", "data-dsh-browser": "menu", "data-dsh-browser-menu-kind": menu.kind,
+            style: menu.kind === "page" ? {left: `${menu.x}px`, top: `${menu.y}px`} : {right: "8px", top: "34px"},
+            onClick: event => event.stopPropagation(),
+          }, ...(menu.kind === "page"
+            ? [
+                menuItem(copy("copy"), () => void copySelection(), {id: "copy"}),
+                menuItem(copy("paste"), () => void pasteClipboard(), {id: "paste"}),
+                menuItem(copy("selectAll"), () => { setMenu(undefined); send({action: "_input", kind: "key", key: "Ctrl+A", observation: observation.current}); }, {id: "select-all"}),
+              ]
+            : [
+                menuItem(`${copy("zoomOut")}  ${Math.round(zoom * 100)}%`, () => { setMenu(undefined); stepZoom(-1); }, {id: "zoom-out", disabled: zoom <= ZOOM_STEPS[0]}),
+                menuItem(copy("zoomIn"), () => { setMenu(undefined); stepZoom(1); }, {id: "zoom-in", disabled: zoom >= ZOOM_STEPS[ZOOM_STEPS.length - 1]}),
+                menuItem(copy("zoomReset"), () => { setMenu(undefined); setZoom(1); }, {id: "zoom-reset", checked: zoom === 1}),
+                menuItem(copy("layoutDesktop"), () => { setMenu(undefined); setDesktop(true); }, {id: "layout-desktop", checked: desktop}),
+                menuItem(copy("layoutFit"), () => { setMenu(undefined); setDesktop(false); }, {id: "layout-fit", checked: !desktop}),
+                menuItem(copy("newTab"), () => { setMenu(undefined); tabAction("new"); }, {id: "new-tab"}),
+              ])),
+          (loading || stale || note) && React.createElement("div", {className: "dsh-browser-status", "data-dsh-browser": "status"},
+            loading && React.createElement("span", {className: "dsh-browser-progress", "data-dsh-browser-progress": "on", "aria-hidden": "true"}),
+            stale && !loading && React.createElement("span", {className: "dsh-browser-chip", "data-dsh-browser-stale": "on"}, copy("stale")),
+            note && React.createElement("span", {className: "dsh-browser-chip", "data-dsh-browser-note": "on"}, note)
+          ),
           empty && React.createElement("div", {className: "dsh-browser-empty", "data-dsh-browser": "empty"},
             React.createElement("span", {className: "dsh-browser-empty-mark", "aria-hidden": "true"}, "\u25cb"),
             React.createElement("p", {className: "dsh-browser-empty-title"}, copy("emptyTitle")),
@@ -734,13 +1016,26 @@ window.__ModuleLoader__.load({
       style.dataset.dshBrowserStyle = "true";
       style.textContent = `
         .dsh-browser-body { box-sizing: border-box; display: flex; flex-direction: column; min-width: 0; height: 100%; background: var(--dsw-alias-bg-base, #fff); color: var(--dsw-alias-label-primary, #17191c); }
-        .dsh-browser-toolbar { box-sizing: border-box; display: flex; align-items: center; gap: 6px; min-width: 0; padding: 8px; border-bottom: 1px solid var(--dsw-alias-border-l2, rgb(0 0 0 / 10%)); }
+        .dsh-browser-tabs { box-sizing: border-box; display: flex; align-items: flex-end; gap: 3px; min-width: 0; padding: 6px 6px 0; overflow-x: auto; scrollbar-width: none; }
+        .dsh-browser-tabs::-webkit-scrollbar { display: none; }
+        .dsh-browser-tab { display: flex; align-items: center; min-width: 0; max-width: 168px; flex: 0 1 auto; border: 1px solid transparent; border-bottom: none; border-radius: 7px 7px 0 0; background: var(--dsw-alias-bg-layer-2, rgb(0 0 0 / 4%)); }
+        .dsh-browser-tab[data-active="true"] { border-color: var(--dsw-alias-border-l2, rgb(0 0 0 / 10%)); background: var(--dsw-alias-bg-layer-1, #fff); }
+        .dsh-browser-tab-label { display: flex; align-items: center; gap: 5px; min-width: 0; height: 26px; border: 0; padding: 0 4px 0 9px; background: none; color: var(--dsw-alias-label-secondary, #61666b); cursor: pointer; font: inherit; font-size: 11px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+        .dsh-browser-tab[data-active="true"] .dsh-browser-tab-label { color: var(--dsw-alias-label-primary, #17191c); }
+        .dsh-browser-tab-spin { color: var(--dsw-alias-state-business-primary, #276ef1); }
+        .dsh-browser-tab-close, .dsh-browser-tab-new { flex: none; border: 0; border-radius: 5px; background: none; color: var(--dsw-alias-label-secondary, #61666b); cursor: pointer; font: inherit; }
+        .dsh-browser-tab-close { width: 18px; height: 18px; margin-right: 3px; font-size: 13px; line-height: 1; }
+        .dsh-browser-tab-close:hover, .dsh-browser-tab-new:hover { background: var(--dsw-alias-interactive-bg-hover, rgb(0 0 0 / 8%)); color: var(--dsw-alias-label-primary, #17191c); }
+        .dsh-browser-tab-new { width: 24px; height: 24px; margin: 0 0 2px 2px; font-size: 15px; line-height: 1; }
+        .dsh-browser-toolbar { box-sizing: border-box; display: flex; align-items: center; gap: 6px; min-width: 0; padding: 6px 8px 8px; border-bottom: 1px solid var(--dsw-alias-border-l2, rgb(0 0 0 / 10%)); }
         .dsh-browser-address { box-sizing: border-box; min-width: 0; height: 30px; flex: 1; border: 1px solid var(--dsw-alias-border-l3, rgb(0 0 0 / 18%)); border-radius: 6px; padding: 0 8px; color: inherit; background: var(--dsw-alias-bg-layer-1, #fff); font: inherit; font-size: 12px; outline: none; }
         .dsh-browser-address:focus { border-color: var(--dsw-alias-state-business-primary, #276ef1); box-shadow: 0 0 0 2px color-mix(in srgb, var(--dsw-alias-state-business-primary, #276ef1) 22%, transparent); }
         .dsh-browser-action { flex: none; min-width: 30px; height: 30px; border: 1px solid var(--dsw-alias-border-l3, rgb(0 0 0 / 18%)); border-radius: 6px; padding: 0 9px; color: inherit; background: var(--dsw-alias-bg-layer-1, #fff); cursor: pointer; font: inherit; font-size: 12px; }
-        .dsh-browser-action:hover { background: var(--dsw-alias-interactive-bg-hover, rgb(0 0 0 / 6%)); }
+        .dsh-browser-action:hover:enabled { background: var(--dsw-alias-interactive-bg-hover, rgb(0 0 0 / 6%)); }
+        .dsh-browser-action:disabled { opacity: 0.4; cursor: default; }
         .dsh-browser-error { box-sizing: border-box; padding: 6px 10px; color: var(--dsw-alias-state-error-primary, #b13e4a); background: color-mix(in srgb, var(--dsw-alias-state-error-primary, #b13e4a) 8%, transparent); font-size: 12px; line-height: 16px; }
-        .dsh-browser-stage { position: relative; flex: 1; min-height: 0; overflow: hidden; background: var(--dsw-alias-bg-base, #fff); }
+        .dsh-browser-stage { position: relative; flex: 1; min-height: 0; overflow: hidden; background: var(--dsw-alias-bg-layer-2, #f4f5f7); }
+        .dsh-browser-view { position: absolute; left: 50%; top: 50%; transform: translate(-50%, -50%); }
         .dsh-browser-frame, .dsh-browser-overlay { position: absolute; inset: 0; display: block; width: 100%; height: 100%; }
         .dsh-browser-frame { background: #fff; }
         .dsh-browser-overlay { pointer-events: none; }
@@ -752,6 +1047,15 @@ window.__ModuleLoader__.load({
         .dsh-browser-empty-title { margin: 0; font-size: 13px; }
         .dsh-browser-empty-hint { margin: 0; max-width: 320px; font-size: 12px; color: var(--dsw-alias-label-tertiary, #81858c); }
         .dsh-browser-note { flex: none; padding: 0 6px; color: var(--dsw-alias-label-tertiary, #81858c); font-size: 11px; line-height: 30px; }
+        .dsh-browser-status { position: absolute; left: 0; right: 0; top: 0; display: flex; align-items: center; justify-content: flex-end; gap: 6px; padding: 6px 8px; pointer-events: none; }
+        .dsh-browser-progress { position: absolute; left: 0; right: 0; top: 0; height: 2px; background: linear-gradient(90deg, transparent, var(--dsw-alias-state-business-primary, #276ef1), transparent); background-size: 40% 100%; background-repeat: no-repeat; animation: dsh-browser-progress 1.1s linear infinite; }
+        @keyframes dsh-browser-progress { from { background-position: -40% 0; } to { background-position: 140% 0; } }
+        .dsh-browser-chip { border-radius: 999px; padding: 2px 8px; background: color-mix(in srgb, var(--dsw-alias-label-primary, #17191c) 74%, transparent); color: var(--dsw-alias-bg-base, #fff); font-size: 11px; line-height: 16px; }
+        .dsh-browser-menu { position: absolute; z-index: 3; min-width: 190px; padding: 5px; border: 1px solid var(--dsw-alias-border-l2, rgb(0 0 0 / 12%)); border-radius: 9px; background: var(--dsw-alias-bg-layer-1, #fff); box-shadow: 0 10px 28px rgb(0 0 0 / 18%); }
+        .dsh-browser-menu-item { display: flex; align-items: center; justify-content: space-between; gap: 10px; width: 100%; border: 0; border-radius: 6px; padding: 7px 9px; background: none; color: inherit; cursor: pointer; font: inherit; font-size: 12px; text-align: left; }
+        .dsh-browser-menu-item:hover:enabled { background: var(--dsw-alias-interactive-bg-hover, rgb(0 0 0 / 6%)); }
+        .dsh-browser-menu-item:disabled { opacity: 0.45; cursor: default; }
+        .dsh-browser-menu-check { color: var(--dsw-alias-state-business-primary, #276ef1); }
         .dsh-browser-live { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
       `;
       document.head.appendChild(style);

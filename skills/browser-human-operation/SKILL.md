@@ -16,6 +16,10 @@ Use the `browser` tool to operate the page itself. A URL is only an address for 
 
 The Web right Sidebar streams the same isolated Chromium session and annotates it: your clicks, inputs, keys, scrolls, and drags appear as a label led by a mouse pointer, and the field you focus shows its outline and caption. Humans can click the rendered frame and type into it, with a click ripple, a hover outline, and a focus outline showing them where input lands. Credentials, passwords, MFA codes, and private tokens must be entered by the human in that Sidebar; never extract or request them.
 
+## Tabs and the shared pane
+
+The pane keeps a tab strip like a browser. `tabs` with `op: list` reports every tab with its id, URL, load state and which one is active; `op: new`, `op: select` with `tab`, and `op: close` with `tab` change that set. A window the site opens by itself becomes a managed tab and the pane follows it, so a popup is not lost. `list` is a read; opening, switching and closing consume the observation, and every action addresses the active tab, so re-observe after any tab change. The human can also open, switch or close tabs in the pane, and can switch between the desktop viewport and the Sidebar width or change the zoom; take a fresh `screenshot` before a coordinate click after any of those changes.
+
 ## Visual interaction
 
 Use `screenshot` when position, icons, canvas content, responsive layout, or an element without a useful accessible name matters. Screenshots are image attachments, so use an image-capable model to interpret them. Coordinates are CSS viewport coordinates with origin at the top-left of the current page viewport. Click the center of the visible target and keep a margin from neighboring controls. Re-observe after navigation, scrolling, dialogs, or layout changes because old coordinates and observations become unsafe.
