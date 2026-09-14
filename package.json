@@ -6,7 +6,8 @@
   "main": "index.js",
   "exports": {
     ".": "./index.js",
-    "./client": "./client.js"
+    "./client": "./client.js",
+    "./package.json": "./package.json"
   },
   "files": ["index.js", "browser.js", "client.js", "skills", "cordis.patch.yml", "README.md", "README.en.md", "LICENSE", "NOTICE", "docs"],
   "scripts": {"test": "node --test test/*.test.js", "browser:install": "playwright install chromium"},
