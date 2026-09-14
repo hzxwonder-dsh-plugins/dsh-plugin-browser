@@ -7,6 +7,56 @@ export function httpUrl(input) {
   return url.href;
 }
 
+/** Managed tabs one session may hold; the limit is a refusal, never an eviction. */
+export const TAB_LIMIT = 12;
+
+/** Visits one session remembers; the oldest record is dropped past this bound. */
+export const VISITED_LIMIT = 256;
+
+/**
+ * The origin key of one address, or undefined when it is not a web address.
+ * about:blank, empty input and other schemes are plumbing rather than places a
+ * top-level navigation can be judged against, so they carry no key.
+ */
+export function originKey(input) {
+  if (typeof input !== 'string' || input === '') return undefined;
+  let url;
+  try { url = new URL(input); } catch { return undefined; }
+  return ['http:', 'https:'].includes(url.protocol) ? url.origin : undefined;
+}
+
+/**
+ * Normalize the configured origin allow list. An empty list admits every origin,
+ * which is the behaviour of a deployment that configured no policy at all; a
+ * malformed entry is reported at construction instead of silently never matching.
+ */
+export function originPolicy(entries = []) {
+  if (!Array.isArray(entries)) throw new Error('BROWSER_INVALID_URL: allowedOrigins must be an array of origins');
+  const origins = new Set();
+  for (const entry of entries) {
+    const key = originKey(entry);
+    if (key === undefined) throw new Error(`BROWSER_INVALID_URL: allowedOrigins entry ${JSON.stringify(entry)} is not an http(s) origin`);
+    origins.add(key);
+  }
+  return origins;
+}
+
+/** Whether one address passes the allow list; addresses without an origin always do. */
+export function originAdmitted(origins, address) {
+  if (origins.size === 0) return true;
+  const key = originKey(address);
+  return key === undefined || origins.has(key);
+}
+
+/** Record one visit newest-first, deduplicated by URL and bounded by VISITED_LIMIT. */
+export function rememberVisit(visited, visit) {
+  const known = visited.findIndex(item => item.url === visit.url);
+  if (known !== -1) visited.splice(known, 1);
+  visited.unshift(visit);
+  if (visited.length > VISITED_LIMIT) visited.length = VISITED_LIMIT;
+  return visited;
+}
+
 export function redact(input, limit = 24000) {
   return String(input).slice(0, limit)
     .replace(/\b(?:sk-[\w-]{16,}|gh[pousr]_[\w]{20,})\b/g, '[redacted]')
@@ -55,7 +105,7 @@ function activeTab(session) {
 }
 
 /** Pane actions that answer without waiting for the action queue. */
-const CONTROL_ACTIONS = new Set(['_view', '_hover', '_selection', '_stop']);
+const CONTROL_ACTIONS = new Set(['_view', '_hover', '_selection', '_history', '_stop']);
 
 const SCREENCAST_QUALITY = 62;
 
@@ -103,6 +153,7 @@ class Subscriber {
 export class BrowserSessions {
   constructor(config = {}) {
     this.config = config;
+    this.allowedOrigins = originPolicy(config.allowedOrigins ?? []);
     this.sessions = new Map();
     this.queues = new Map();
     this.closed = false;
@@ -132,12 +183,18 @@ export class BrowserSessions {
     if (this.sessions.has(id)) return this.sessions.get(id);
     if (this.sessions.size >= 8) throw new Error('BROWSER_SESSION_LIMIT: close an unused session browser');
     const pending = (async () => {
+      // Permissions are cleared and downloads never land: the Agent drives pages
+      // it does not own, so no site may reach the camera, the microphone, the
+      // location or the clipboard, and no response may write a file to disk
+      // behind the operator's back. Service workers stay blocked for the same
+      // reason — nothing of the site survives the tab that loaded it.
       const context = await (await this.browser()).newContext({viewport: {width: 1280, height: 800}, deviceScaleFactor: 2, acceptDownloads: false, serviceWorkers: 'block'});
+      await context.clearPermissions();
       await context.route('**/*', route => {
         try { httpUrl(route.request().url()); return route.continue(); } catch { return route.abort(); }
       });
       const session = {
-        context, observation: 0, tabSeq: 0, tabs: [], activeId: undefined,
+        context, observation: 0, tabSeq: 0, tabs: [], activeId: undefined, visited: [],
         subscribers: new Set(), screencast: false, streamingId: undefined, pattern: 0,
         pointer: undefined, viewport: {width: 1280, height: 800},
       };
@@ -151,12 +208,9 @@ export class BrowserSessions {
         canGoForward: {get: () => activeTab(session).index < activeTab(session).history.length - 1},
       });
       await this.openTab(session, await context.newPage());
-      context.on('page', popup => {
-        // A page the site opened by itself (target=_blank, window.open) becomes
-        // a managed tab in the pane instead of an invisible extra window.
-        if (session.tabs.some(tab => tab.page === popup)) return;
-        void this.openTab(session, popup).then(entry => this.select(session, entry.id)).catch(() => {});
-      });
+      // A page the site opened by itself (target=_blank, window.open) becomes
+      // a managed tab in the pane instead of an invisible extra window.
+      context.on('page', popup => { void this.adopt(session, popup).catch(() => {}); });
       context.on('close', () => { session.subscribers.forEach(subscriber => subscriber.close()); });
       return session;
     })();
@@ -237,6 +291,18 @@ export class BrowserSessions {
     page.on('framenavigated', frame => {
       if (frame !== page.mainFrame()) return;
       const url = page.url();
+      // A redirect, a meta refresh or a script the site owns leaves the allow
+      // list without ever passing the navigate action. The request layer keeps
+      // its scheme-only policy, so this commit is the one place a site-driven
+      // navigation is judged; it is already on screen by now, so the tab is sent
+      // back to the blank page instead of showing an origin the policy excluded.
+      if (!originAdmitted(this.allowedOrigins, url)) {
+        entry.messages.push({level: 'error', text: redact(`BROWSER_ORIGIN_DENIED: ${url}`, 2000)});
+        if (entry.messages.length > 100) entry.messages.shift();
+        void page.goto('about:blank').catch(() => {});
+        return;
+      }
+      void this.visit(session, page).catch(() => {});
       // A back or forward move lands on an entry this tab already knows, so the
       // history pointer follows it instead of appending a duplicate.
       const rewind = entry.pending !== undefined && entry.history[entry.pending] === url ? entry.pending : undefined;
@@ -259,6 +325,22 @@ export class BrowserSessions {
     this.emitTabs(session);
     if (session.subscribers.size > 0) await this.viewport(session, session.viewport, {force: true});
     return entry;
+  }
+
+  /**
+   * Take over one page the site opened by itself. Past the tab limit the popup is
+   * closed and dropped without an error: the site opened it, so no caller is
+   * waiting for an answer, and the pane keeps the tabs the operator can see
+   * rather than trading one of them for a window nobody asked to show.
+   */
+  async adopt(session, popup) {
+    if (session.tabs.some(tab => tab.page === popup)) return;
+    if (session.tabs.length >= TAB_LIMIT) {
+      await popup.close().catch(() => {});
+      return;
+    }
+    const entry = await this.openTab(session, popup);
+    await this.select(session, entry.id);
   }
 
   /** Show one tab: its page becomes the pane picture and the input target. */
@@ -430,11 +512,43 @@ export class BrowserSessions {
     this.emit(session, {t: 'pointer', kind, source, label: redact(String(label ?? '')), x: session.pointer?.x, y: session.pointer?.y, ts: Date.now()});
   }
 
+  /** Reject one top-level navigation the configured allow list does not admit. */
+  assertAdmitted(address) {
+    if (originAdmitted(this.allowedOrigins, address)) return;
+    throw new Error(`BROWSER_ORIGIN_DENIED: ${redact(String(address ?? ''), 200)}`);
+  }
+
+  /**
+   * Record one committed top-level address in the session's visit log. Only web
+   * documents count as visits: about:blank and other schemes are plumbing, not
+   * places the operator went. A denied origin never enters the log, whichever
+   * layer noticed it, because the log is what the pane offers to go back to. The
+   * title is read after the record exists, since the log may be asked for before
+   * the page has one.
+   */
+  async visit(session, page) {
+    const url = page.url();
+    if (originKey(url) === undefined || !originAdmitted(this.allowedOrigins, url)) return;
+    const record = {url: redact(url, 2000), title: '', at: Date.now()};
+    rememberVisit(session.visited, record);
+    const title = await page.title().catch(() => '');
+    // The page may have moved on while its title was being read, and that title
+    // belongs to the next address rather than to this record.
+    if (page.url() === url) record.title = redact(String(title), 500);
+  }
+
   async run(id, args, signal) {
     if (!id) throw new Error('BROWSER_SESSION_REQUIRED');
-    // The pane's control plane — looking at the page, reading its selection and
-    // stopping a load — answers while a slow navigation is still in flight,
-    // exactly like a browser's own stop and reload buttons.
+    // A denied address is refused before any context exists, so the allow list
+    // costs nothing to enforce; the page-level guard repeats the test for
+    // navigation the site itself starts.
+    if (args.action === 'navigate') this.assertAdmitted(args.url);
+    // The visit log of a session without a browser is empty, and answering that
+    // directly keeps a pure read from launching Chromium just to say so.
+    if (args.action === '_history' && !this.sessions.has(id)) return {history: [], historyTotal: 0};
+    // The pane's control plane — looking at the page, reading its selection or
+    // its visit log, and stopping a load — answers while a slow navigation is
+    // still in flight, exactly like a browser's own stop and reload buttons.
     if (CONTROL_ACTIONS.has(args.action)) {
       const session = await this.session(id);
       return this.operate(session, args);
@@ -482,11 +596,19 @@ export class BrowserSessions {
         ...session.viewport, observation: session.observation, seq: session.pattern,
       };
     }
+    if (args.action === '_history') {
+      // A pure read of this session's own visit log: the pane shows where this
+      // browser has been without consuming an observation.
+      return {history: session.visited, historyTotal: session.visited.length};
+    }
     if (args.action === '_tabs') {
       // Switching tabs bumps the observation, so the Agent is told to look
       // again; listing tabs is a pure read like hovering.
       if (args.op === undefined || args.op === 'list') return {tabs: this.tabList(session), activeId: session.activeId};
       if (args.op === 'new') {
+        // An explicit new tab is refused at the limit instead of evicting a tab
+        // the operator opened: a refusal is predictable, a vanished page is not.
+        if (session.tabs.length >= TAB_LIMIT) throw new Error('BROWSER_TAB_LIMIT: close a tab before opening another');
         const entry = await this.openTab(session, await session.context.newPage());
         await this.select(session, entry.id);
         return {tabs: this.tabList(session), activeId: session.activeId, observation: session.observation};
@@ -561,6 +683,9 @@ export class BrowserSessions {
     }
     if (args.action === 'navigate') {
       await page.goto(httpUrl(args.url), {waitUntil: 'domcontentloaded'});
+      // Recording again after the load gives the log a filled-in title right
+      // away; the frame event's own record of the same URL is deduplicated.
+      await this.visit(session, page);
       await this.afterAction(session, {action: 'navigate', url: page.url()});
       return this.snapshot(session);
     }

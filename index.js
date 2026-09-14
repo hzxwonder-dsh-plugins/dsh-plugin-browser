@@ -32,15 +32,16 @@ export function apply(ctx, config = {}) {
           const raw = await request.text();
           if (Buffer.byteLength(raw) > 20000) throw new Error('BROWSER_INPUT_TOO_LARGE');
           const args = JSON.parse(raw);
-          if (!['navigate', 'close', '_input', '_hover', '_back', '_forward', '_reload', '_tabs', '_stop', '_selection'].includes(args?.action)) throw new Error('BROWSER_INVALID_ACTION');
-          // Reads — the hover cue, the tab list, the page selection — stay
-          // available in a read-only Session; every mutation is denied.
-          if (!['_hover', '_selection', '_stop'].includes(args.action) && !(args.action === '_tabs' && (args.op === undefined || args.op === 'list')) && web.get('sandboxPolicy')?.resolve({session})?.mode === 'read-only') throw new Error('BROWSER_READ_ONLY');
+          if (!['navigate', 'close', '_input', '_hover', '_back', '_forward', '_reload', '_tabs', '_stop', '_selection', '_history'].includes(args?.action)) throw new Error('BROWSER_INVALID_ACTION');
+          // Reads — the hover cue, the tab list, the page selection, the visit
+          // log — stay available in a read-only Session; every mutation is denied.
+          if (!['_hover', '_selection', '_stop', '_history'].includes(args.action) && !(args.action === '_tabs' && (args.op === undefined || args.op === 'list')) && web.get('sandboxPolicy')?.resolve({session})?.mode === 'read-only') throw new Error('BROWSER_READ_ONLY');
           const result = await browsers.run(sessionId, args, request.signal);
-          const {observation, hover, tabs, activeId, loading, canGoBack, canGoForward, text, stopped} = result;
+          const {observation, hover, tabs, activeId, loading, canGoBack, canGoForward, text, stopped, history, historyTotal} = result;
           return Response.json({
             ok: true, observation, ...(hover ? {hover} : {}), ...(text !== undefined ? {text} : {}), ...(stopped ? {stopped} : {}),
             ...(tabs ? {tabs, activeId, loading, canGoBack, canGoForward} : {}),
+            ...(history ? {history, historyTotal} : {}),
           }, {headers});
         } catch (error) {
           const code = /^BROWSER_[A-Z_]+/.exec(String(error.message))?.[0] ?? 'BROWSER_REQUEST_FAILED';

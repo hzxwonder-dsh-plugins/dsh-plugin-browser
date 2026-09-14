@@ -26,6 +26,10 @@ window.__ModuleLoader__.load({
     const DESKTOP_WIDTH = 1280;
     /** How long a picture may stand still before the pane says so. */
     const STALE_MS = 2500;
+    /** Main-area slot key: the same browser rendered into the whole window. */
+    const PANEL = "browser";
+    /** Visited pages the address field offers, newest first. */
+    const HISTORY_LIMIT = 40;
     const COPY = {
       en: {
         "browser": "Browser",
@@ -88,6 +92,13 @@ window.__ModuleLoader__.load({
         "copyEmpty": "Nothing is selected on the page",
         "pasteHint": "The clipboard could not be read. Press Ctrl+V in the page.",
         "stale": "Picture paused",
+        "expand": "Open in the main area",
+        "collapse": "Return to the Sidebar",
+        "history": "Visited pages",
+        "historyEmpty": "This Session has not visited a page yet",
+        "dismiss": "Dismiss",
+        "err.origin": "That address is outside the origins this deployment allows.",
+        "err.limit": "This Session already holds its maximum tabs. Close one before opening another.",
       },
       zh: {
         "browser": "浏览器",
@@ -150,6 +161,13 @@ window.__ModuleLoader__.load({
         "copyEmpty": "页面上没有选中内容",
         "pasteHint": "无法读取剪贴板，请在页面里按 Ctrl+V。",
         "stale": "画面已暂停",
+        "expand": "在主页区打开",
+        "collapse": "收回到侧栏",
+        "history": "访问记录",
+        "historyEmpty": "本会话还没有访问过页面",
+        "dismiss": "关闭提示",
+        "err.origin": "该地址不在本部署允许的来源内，已拒绝打开。",
+        "err.limit": "本会话的标签页已达上限，请先关闭一个再新建。",
       },
     };
     const ERROR_KEYS = {
@@ -168,6 +186,8 @@ window.__ModuleLoader__.load({
       BROWSER_INVALID_URL: "err.invalid",
       BROWSER_HTTP_URL_REQUIRED: "err.invalid",
       BROWSER_UNKNOWN_TAB: "err.tab",
+      BROWSER_ORIGIN_DENIED: "err.origin",
+      BROWSER_TAB_LIMIT: "err.limit",
     };
     const AGENT_LABELS = {click: "agentClick", fill: "agentFill", press: "agentPress", scroll: "agentScroll", drag: "agentDrag", navigate: "agentNavigate"};
     const HUMAN_LABELS = {click: "humanClick", drag: "humanDrag", scroll: "humanScroll"};
@@ -368,13 +388,19 @@ window.__ModuleLoader__.load({
       }
     }
 
-    function BrowserBody({useTabInfo, sessionId, t}) {
-      const {tab} = useTabInfo();
-      const visible = tab.visible;
-      const copy = React.useCallback((key, params) => {
-        const text = t?.(key, params) ?? COPY.en[key] ?? key;
-        return params ? Object.entries(params).reduce((line, [name, value]) => line.replace(`{${name}}`, String(value)), text) : text;
-      }, [t]);
+    /** One dictionary lookup, with the English copy as the last resort. */
+    function translate(t, key, params) {
+      const text = t?.(key, params) ?? COPY.en[key] ?? key;
+      return params ? Object.entries(params).reduce((line, [name, value]) => line.replace(`{${name}}`, String(value)), text) : text;
+    }
+
+    /**
+     * The browser chrome both surfaces share. The Sidebar pane and the
+     * main-area panel are the same component against one Session, so a page
+     * opened in either place is the same page, with the same tabs and history.
+     */
+    function BrowserSurface({sessionId, t, visible, placement, onExpand, onCollapse}) {
+      const copy = React.useCallback((key, params) => translate(t, key, params), [t]);
       const [address, setAddress] = React.useState("");
       const [active, setActive] = React.useState(false);
       const [loading, setLoading] = React.useState(false);
@@ -389,6 +415,8 @@ window.__ModuleLoader__.load({
       const [menu, setMenu] = React.useState(undefined);
       const [note, setNote] = React.useState("");
       const [stale, setStale] = React.useState(false);
+      const [history, setHistory] = React.useState([]);
+      const [historyOpen, setHistoryOpen] = React.useState(false);
       const stage = React.useRef(null);
       const surface = React.useRef(null);
       const overlay = React.useRef(null);
@@ -673,6 +701,14 @@ window.__ModuleLoader__.load({
         if (!response.ok) throw new Error(value.error || "BROWSER_REQUEST_FAILED");
         return value;
       };
+      /** The Session's own visited pages. The Host bounds the log, so the pane
+       * only trims what it is willing to draw in one dropdown. */
+      const loadHistory = React.useCallback(async () => {
+        try {
+          const value = await post({action: "_history"});
+          setHistory(Array.isArray(value.history) ? value.history.slice(0, HISTORY_LIMIT) : []);
+        } catch { setHistory([]); }
+      }, [endpoint]);
       /** Remember a pane point as a fraction of the picture the human saw. */
       const asFraction = point => ({
         fx: point.x / Math.max(1, viewport.current.width), fy: point.y / Math.max(1, viewport.current.height),
@@ -749,9 +785,9 @@ window.__ModuleLoader__.load({
         })();
       };
 
-      const iconButton = (label, glyph, action) => React.createElement("button", {
+      const iconButton = (label, glyph, action, run) => React.createElement("button", {
         type: "button", className: "dsh-browser-action", title: label, "aria-label": label,
-        "data-dsh-browser-action": action, onClick: () => { setError(""); send({action}); },
+        "data-dsh-browser-action": action, onClick: () => { setError(""); (run ?? (() => send({action})))(); },
       }, glyph);
       /** History buttons mirror a real browser: unavailable moves are disabled. */
       const navButton = (label, glyph, action, disabled) => React.createElement("button", {
@@ -777,9 +813,9 @@ window.__ModuleLoader__.load({
         if (x < 0 || y < 0 || x >= viewport.current.width || y >= viewport.current.height) return undefined;
         return {x, y};
       };
-      const navigate = () => {
+      const navigateTo = value => {
         try {
-          const target = httpUrl(address.trim());
+          const target = httpUrl(value.trim());
           editing.current = false;
           setError("");
           setAddress(target);
@@ -787,6 +823,7 @@ window.__ModuleLoader__.load({
           send({action: "navigate", url: target});
         } catch { setError(copy("err.invalid")); }
       };
+      const navigate = () => navigateTo(address);
       /** Copy the page's own selection into the human's clipboard. */
       const copySelection = async () => {
         setMenu(undefined);
@@ -840,7 +877,7 @@ window.__ModuleLoader__.load({
       };
 
       const empty = !active;
-      return React.createElement("div", {className: "dsh-browser-body", "data-dsh-browser": "body"},
+      return React.createElement("div", {className: "dsh-browser-body", "data-dsh-browser": "body", "data-dsh-browser-surface": placement},
         React.createElement("div", {className: "dsh-browser-tabs", role: "tablist", "aria-label": copy("tabs"), "data-dsh-browser": "tabs"},
           tabs.map(entry => React.createElement("div", {
             key: entry.id, className: "dsh-browser-tab", "data-dsh-browser-tab": entry.id,
@@ -860,33 +897,74 @@ window.__ModuleLoader__.load({
             "data-dsh-browser-action": "new-tab", onClick: () => tabAction("new"),
           }, "+")
         ),
-        React.createElement("div", {className: "dsh-browser-toolbar"},
-          navButton(copy("back"), "\u2190", "_back", !nav.canGoBack),
-          navButton(copy("forward"), "\u2192", "_forward", !nav.canGoForward),
-          loading
-            ? React.createElement("button", {
-                type: "button", className: "dsh-browser-action", title: copy("stop"), "aria-label": copy("stop"),
-                "data-dsh-browser-action": "_stop", onClick: () => send({action: "_stop"}),
-              }, "\u25a0")
-            : iconButton(copy("reload"), "\u21bb", "_reload"),
-          React.createElement("input", {
-            ref: addressField, className: "dsh-browser-address", value: address,
-            onChange: event => setAddress(event.target.value),
-            onFocus: () => { editing.current = true; },
-            onBlur: () => { editing.current = false; },
-            onKeyDown: event => { event.stopPropagation(); if (event.key === "Enter") navigate(); },
-            spellCheck: false, inputMode: "url", "aria-label": copy("address"), placeholder: "https://",
-          }),
-          React.createElement("button", {type: "button", className: "dsh-browser-action", title: copy("go"), "aria-label": copy("go"), onClick: navigate}, "\u21b5"),
-          React.createElement("button", {
-            type: "button", className: "dsh-browser-action", title: copy("tools"), "aria-label": copy("tools"),
-            "data-dsh-browser-action": "menu", "aria-expanded": menu?.kind === "tools" ? "true" : "false",
-            onClick: event => { event.stopPropagation(); setMenu(menu?.kind === "tools" ? undefined : {kind: "tools"}); },
-          }, "\u22ef"),
-          mode !== "stream" && React.createElement("span", {className: "dsh-browser-note", "data-dsh-browser-mode": mode}, copy("polling")),
-          iconButton(copy("close"), "\u00d7", "close")
+        React.createElement("div", {className: "dsh-browser-toolbar", "data-dsh-browser": "toolbar"},
+          React.createElement("div", {className: "dsh-browser-group", "data-dsh-browser-group": "nav"},
+            navButton(copy("back"), "\u2190", "_back", !nav.canGoBack),
+            navButton(copy("forward"), "\u2192", "_forward", !nav.canGoForward),
+            loading
+              ? React.createElement("button", {
+                  type: "button", className: "dsh-browser-action", title: copy("stop"), "aria-label": copy("stop"),
+                  "data-dsh-browser-action": "_stop", onClick: () => send({action: "_stop"}),
+                }, "\u25a0")
+              : iconButton(copy("reload"), "\u21bb", "_reload")
+          ),
+          React.createElement("div", {className: "dsh-browser-group dsh-browser-group-address", "data-dsh-browser-group": "address"},
+            React.createElement("input", {
+              ref: addressField, className: "dsh-browser-address", value: address,
+              onChange: event => setAddress(event.target.value),
+              // Focusing the field offers the pages this Session has visited,
+              // the way a browser offers them, without a second control.
+              onFocus: () => { editing.current = true; setHistoryOpen(true); void loadHistory(); },
+              onBlur: () => { editing.current = false; setHistoryOpen(false); },
+              onKeyDown: event => {
+                event.stopPropagation();
+                if (event.key === "Enter") { setHistoryOpen(false); navigate(); return; }
+                if (event.key === "Escape" && historyOpen) { event.preventDefault(); setHistoryOpen(false); }
+              },
+              spellCheck: false, inputMode: "url", "aria-label": copy("address"), placeholder: "https://",
+              "aria-expanded": historyOpen ? "true" : "false",
+            }),
+            historyOpen && React.createElement("div", {
+              className: "dsh-browser-history", role: "listbox", "aria-label": copy("history"), "data-dsh-browser": "history",
+            },
+              history.length === 0
+                ? React.createElement("p", {className: "dsh-browser-history-empty"}, copy("historyEmpty"))
+                : history.map(item => React.createElement("button", {
+                    key: item.url, type: "button", role: "option", className: "dsh-browser-history-item",
+                    "data-dsh-browser-history": item.url, title: item.url,
+                    // The field keeps focus while the human picks a row.
+                    onMouseDown: event => event.preventDefault(),
+                    onClick: () => { setHistoryOpen(false); navigateTo(item.url); },
+                  },
+                    React.createElement("span", {className: "dsh-browser-history-title"}, item.title || tabLabel(item.url, copy("tabBlank"))),
+                    React.createElement("span", {className: "dsh-browser-history-url"}, item.url)
+                  ))
+            ),
+            React.createElement("button", {type: "button", className: "dsh-browser-action", title: copy("go"), "aria-label": copy("go"), onClick: navigate}, "\u21b5")
+          ),
+          React.createElement("div", {className: "dsh-browser-group", "data-dsh-browser-group": "view"},
+            React.createElement("button", {
+              type: "button", className: "dsh-browser-action", title: copy("tools"), "aria-label": copy("tools"),
+              "data-dsh-browser-action": "menu", "aria-expanded": menu?.kind === "tools" ? "true" : "false",
+              onClick: event => { event.stopPropagation(); setMenu(menu?.kind === "tools" ? undefined : {kind: "tools"}); },
+            }, "\u22ef"),
+            mode !== "stream" && React.createElement("span", {className: "dsh-browser-note", "data-dsh-browser-mode": mode}, copy("polling"))
+          ),
+          // The window group carries the surface the page is drawn on: the
+          // Sidebar pane offers the main area, the main area offers the pane.
+          React.createElement("div", {className: "dsh-browser-group dsh-browser-group-window", "data-dsh-browser-group": "window"},
+            onExpand && iconButton(copy("expand"), "\u2922", "expand", onExpand),
+            onCollapse && iconButton(copy("collapse"), "\u2921", "collapse", onCollapse),
+            iconButton(copy("close"), "\u00d7", "close")
+          )
         ),
-        error && React.createElement("div", {className: "dsh-browser-error", role: "alert"}, error),
+        error && React.createElement("div", {className: "dsh-browser-error", role: "alert"},
+          React.createElement("span", {className: "dsh-browser-error-text"}, error),
+          React.createElement("button", {
+            type: "button", className: "dsh-browser-error-dismiss", title: copy("dismiss"), "aria-label": copy("dismiss"),
+            onClick: () => setError(""),
+          }, "\u00d7")
+        ),
         React.createElement("div", {className: "dsh-browser-stage", ref: stage, "data-dsh-browser": "stage"},
           React.createElement("div", {
             className: "dsh-browser-view", "data-dsh-browser": "view",
@@ -1010,6 +1088,39 @@ window.__ModuleLoader__.load({
       );
     }
 
+    /**
+     * Sidebar surface: one pane per Session, mounted only while its tab is the
+     * active one, so a pane nobody is looking at asks for no frames at all.
+     */
+    function BrowserPane({useTabInfo, sessionId, t, layout}) {
+      const {tab} = useTabInfo();
+      const open = React.useCallback(() => { layout?.selectPanel(PANEL); }, [layout]);
+      return React.createElement(BrowserSurface, {
+        sessionId, t, placement: "pane", visible: tab.visible,
+        onExpand: layout ? open : undefined,
+      });
+    }
+
+    /**
+     * Main-area surface: the same browser given the whole window, for pages that
+     * need more room than the Sidebar has. It shows the current conversation's
+     * browser and stops streaming whenever another panel owns the main area.
+     */
+    function BrowserPage({usePanelInfo, useSessions, layout, t}) {
+      const visible = typeof usePanelInfo === "function" && usePanelInfo(info => info.activePanelId === PANEL) === true;
+      const sessionId = typeof useSessions === "function" ? useSessions()?.current : undefined;
+      const back = React.useCallback(() => { layout?.selectPanel(null); }, [layout]);
+      if (typeof sessionId !== "string" || sessionId === "") {
+        return React.createElement("div", {className: "dsh-browser-body", "data-dsh-browser": "body", "data-dsh-browser-surface": "page"},
+          React.createElement("div", {className: "dsh-browser-empty", "data-dsh-browser": "empty"},
+            React.createElement("span", {className: "dsh-browser-empty-mark", "aria-hidden": "true"}, "\u25cb"),
+            React.createElement("p", {className: "dsh-browser-empty-title"}, translate(t, "err.session"))
+          )
+        );
+      }
+      return React.createElement(BrowserSurface, {sessionId, t, placement: "page", visible, onCollapse: layout ? back : undefined});
+    }
+
     function installStyles() {
       if (typeof document === "undefined" || document.querySelector("style[data-dsh-browser-style]") !== null) return;
       const style = document.createElement("style");
@@ -1028,12 +1139,25 @@ window.__ModuleLoader__.load({
         .dsh-browser-tab-close:hover, .dsh-browser-tab-new:hover { background: var(--dsw-alias-interactive-bg-hover, rgb(0 0 0 / 8%)); color: var(--dsw-alias-label-primary, #17191c); }
         .dsh-browser-tab-new { width: 24px; height: 24px; margin: 0 0 2px 2px; font-size: 15px; line-height: 1; }
         .dsh-browser-toolbar { box-sizing: border-box; display: flex; align-items: center; gap: 6px; min-width: 0; padding: 6px 8px 8px; border-bottom: 1px solid var(--dsw-alias-border-l2, rgb(0 0 0 / 10%)); }
+        .dsh-browser-group { display: flex; align-items: center; gap: 4px; min-width: 0; }
+        .dsh-browser-group-address { position: relative; flex: 1; gap: 6px; }
+        .dsh-browser-group-address .dsh-browser-address { flex: 1; }
+        .dsh-browser-history { position: absolute; z-index: 4; left: 0; right: 30px; top: 34px; max-height: 260px; overflow-y: auto; padding: 4px; border: 1px solid var(--dsw-alias-border-l2, rgb(0 0 0 / 12%)); border-radius: 9px; background: var(--dsw-alias-bg-layer-1, #fff); box-shadow: 0 10px 28px rgb(0 0 0 / 18%); }
+        .dsh-browser-history-item { display: flex; flex-direction: column; gap: 2px; width: 100%; border: 0; border-radius: 6px; padding: 6px 8px; background: none; color: inherit; cursor: pointer; font: inherit; text-align: left; }
+        .dsh-browser-history-item:hover { background: var(--dsw-alias-interactive-bg-hover, rgb(0 0 0 / 6%)); }
+        .dsh-browser-history-title { font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+        .dsh-browser-history-url { color: var(--dsw-alias-label-tertiary, #81858c); font-size: 11px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+        .dsh-browser-history-empty { margin: 0; padding: 10px 8px; color: var(--dsw-alias-label-tertiary, #81858c); font-size: 12px; }
+        .dsh-browser-group-window { margin-left: auto; }
         .dsh-browser-address { box-sizing: border-box; min-width: 0; height: 30px; flex: 1; border: 1px solid var(--dsw-alias-border-l3, rgb(0 0 0 / 18%)); border-radius: 6px; padding: 0 8px; color: inherit; background: var(--dsw-alias-bg-layer-1, #fff); font: inherit; font-size: 12px; outline: none; }
         .dsh-browser-address:focus { border-color: var(--dsw-alias-state-business-primary, #276ef1); box-shadow: 0 0 0 2px color-mix(in srgb, var(--dsw-alias-state-business-primary, #276ef1) 22%, transparent); }
         .dsh-browser-action { flex: none; min-width: 30px; height: 30px; border: 1px solid var(--dsw-alias-border-l3, rgb(0 0 0 / 18%)); border-radius: 6px; padding: 0 9px; color: inherit; background: var(--dsw-alias-bg-layer-1, #fff); cursor: pointer; font: inherit; font-size: 12px; }
         .dsh-browser-action:hover:enabled { background: var(--dsw-alias-interactive-bg-hover, rgb(0 0 0 / 6%)); }
         .dsh-browser-action:disabled { opacity: 0.4; cursor: default; }
-        .dsh-browser-error { box-sizing: border-box; padding: 6px 10px; color: var(--dsw-alias-state-error-primary, #b13e4a); background: color-mix(in srgb, var(--dsw-alias-state-error-primary, #b13e4a) 8%, transparent); font-size: 12px; line-height: 16px; }
+        .dsh-browser-error { box-sizing: border-box; display: flex; align-items: center; gap: 8px; padding: 6px 10px; color: var(--dsw-alias-state-error-primary, #b13e4a); background: color-mix(in srgb, var(--dsw-alias-state-error-primary, #b13e4a) 8%, transparent); font-size: 12px; line-height: 16px; }
+        .dsh-browser-error-text { flex: 1; min-width: 0; }
+        .dsh-browser-error-dismiss { flex: none; border: 0; border-radius: 5px; padding: 0 6px; background: none; color: inherit; cursor: pointer; font: inherit; font-size: 13px; line-height: 18px; }
+        .dsh-browser-error-dismiss:hover { background: color-mix(in srgb, currentColor 14%, transparent); }
         .dsh-browser-stage { position: relative; flex: 1; min-height: 0; overflow: hidden; background: var(--dsw-alias-bg-layer-2, #f4f5f7); }
         .dsh-browser-view { position: absolute; left: 50%; top: 50%; transform: translate(-50%, -50%); }
         .dsh-browser-frame, .dsh-browser-overlay { position: absolute; inset: 0; display: block; width: 100%; height: 100%; }
@@ -1057,6 +1181,10 @@ window.__ModuleLoader__.load({
         .dsh-browser-menu-item:disabled { opacity: 0.45; cursor: default; }
         .dsh-browser-menu-check { color: var(--dsw-alias-state-business-primary, #276ef1); }
         .dsh-browser-live { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
+        .dsh-browser-body[data-dsh-browser-surface="page"] .dsh-browser-toolbar { padding: 8px 12px 10px; }
+        .dsh-browser-body[data-dsh-browser-surface="page"] .dsh-browser-tabs { padding: 8px 10px 0; }
+        .dsh-browser-body[data-dsh-browser-surface="page"] .dsh-browser-tab { max-width: 220px; }
+        .dsh-browser-body[data-dsh-browser-surface="page"] .dsh-browser-address { height: 32px; font-size: 13px; }
       `;
       document.head.appendChild(style);
     }
@@ -1108,7 +1236,7 @@ window.__ModuleLoader__.load({
       return null;
     }
 
-    const inject = ["slots", "locale", "sidebarRightTabs", "sidebarRight"];
+    const inject = ["slots", "locale", "sidebarRightTabs", "sidebarRight", "layout", "sessions"];
     function apply(ctx) {
       installStyles();
       const t = ctx.locale.bind(NS);
@@ -1127,7 +1255,15 @@ window.__ModuleLoader__.load({
         name: "sidebar.right.pane.tab",
         key: ID,
         locale: NS,
-      }, BrowserBody)), "dsh-plugin-browser: right Sidebar body");
+      }, props => React.createElement(BrowserPane, {...props, layout: ctx.layout}))), "dsh-plugin-browser: right Sidebar body");
+      // The same browser as a main-area panel: the Sidebar pane hands the page
+      // over to the whole window and takes it back, without a second page.
+      const useSessions = () => React.useSyncExternalStore(ctx.sessions.list.subscribe, ctx.sessions.list.getSnapshot);
+      ctx.effect(() => ctx.slots.inject("main", () => ctx.slots.register({
+        name: "main",
+        key: PANEL,
+        locale: NS,
+      }, props => React.createElement(BrowserPage, {...props, useSessions, layout: ctx.layout}))), "dsh-plugin-browser: main-area panel");
       ctx.effect(() => ctx.slots.inject("tool.call.toolview", () => ctx.slots.register({
         name: "tool.call.toolview",
         key: "browser",

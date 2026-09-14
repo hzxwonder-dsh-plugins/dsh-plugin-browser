@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import {createServer} from 'node:http';
 import {existsSync} from 'node:fs';
 import {chromium} from 'playwright';
-import {BrowserSessions, browserKey, encodeEvent, eventStream, httpUrl, playwrightKey, redact, redactValue, viewportBounds} from '../browser.js';
+import {BrowserSessions, browserKey, encodeEvent, eventStream, httpUrl, originAdmitted, originKey, originPolicy, playwrightKey, redact, redactValue, rememberVisit, TAB_LIMIT, viewportBounds, VISITED_LIMIT} from '../browser.js';
 import {readFile} from 'node:fs/promises';
 import {apply} from '../index.js';
 
@@ -21,6 +21,25 @@ async function nextEvent(reader, predicate, timeout = 15000) {
     if (event === undefined) throw new Error('the stream ended early');
     if (predicate(event)) return event;
   }
+}
+
+/** A page-shaped object with no Chromium behind it, for Host bookkeeping tests. */
+function stubPage(url = 'about:blank') {
+  return {url: () => url, title: async () => '', close: async () => {}, setDefaultTimeout() {}, setDefaultNavigationTimeout() {}, on() {}};
+}
+
+function stubTab(index, page = stubPage()) {
+  return {id: `tab-${index}`, page, messages: [], history: [page.url()], index: 0, loading: false};
+}
+
+/** A session-shaped object holding the tab bookkeeping the Host reads. */
+function stubSession(tabs = []) {
+  const session = {tabs, subscribers: new Set(), tabSeq: tabs.length, activeId: tabs.at(-1)?.id, observation: 0, visited: [], viewport: {width: 1280, height: 800}, context: {newPage: async () => stubPage()}};
+  Object.defineProperties(session, {
+    page: {get: () => session.tabs.find(tab => tab.id === session.activeId)?.page},
+    loading: {get: () => false}, canGoBack: {get: () => false}, canGoForward: {get: () => false},
+  });
+  return session;
 }
 
 test('package declares the official right Sidebar client bundle', async () => {
@@ -171,6 +190,145 @@ test('the tab action and the pane clipboard stay inside the published contract',
     assert.deepEqual(await (await post({action: '_tabs', op: 'new'})).json(), {error: 'BROWSER_READ_ONLY'});
     assert.deepEqual(await (await post({action: '_stop'})).json(), {error: 'BROWSER_RUNTIME_MISSING'});
     assert.deepEqual(await (await post({action: '_input', kind: 'click', x: 4, y: 4})).json(), {error: 'BROWSER_READ_ONLY'});
+  } finally { await dispose(); }
+});
+
+test('the origin allow list is optional, normalized and exact', () => {
+  assert.equal(originAdmitted(originPolicy([]), 'https://example.com/anywhere'), true);
+  const origins = originPolicy(['https://Example.com:443/login?next=1']);
+  assert.equal(originAdmitted(origins, 'https://example.com/deep/path'), true);
+  assert.equal(originAdmitted(origins, 'https://example.com.evil.test/'), false);
+  assert.equal(originAdmitted(origins, 'http://example.com/'), false);
+  assert.equal(originAdmitted(origins, 'https://example.com:8443/'), false);
+  assert.equal(originKey('data:text/html,x'), undefined);
+  // about:blank and an empty address never navigate, so the list cannot block them.
+  assert.equal(originAdmitted(origins, 'about:blank'), true);
+  assert.equal(originAdmitted(origins, ''), true);
+  assert.throws(() => originPolicy(['file:///etc/passwd']), /BROWSER_INVALID_URL/);
+  assert.throws(() => originPolicy('https://example.com'), /BROWSER_INVALID_URL/);
+});
+
+test('an off-list navigation is refused before a browser exists', async () => {
+  const browsers = new BrowserSessions({allowedOrigins: ['https://example.com/login'], executablePath: '/nonexistent/dsh-browser/chrome'});
+  const signal = new AbortController().signal;
+  try {
+    await assert.rejects(browsers.run('origin-session', {action: 'navigate', url: 'https://example.com.evil.test/'}, signal), /BROWSER_ORIGIN_DENIED/);
+    await assert.rejects(browsers.run('origin-session', {action: 'navigate', url: 'http://example.com/'}, signal), /BROWSER_ORIGIN_DENIED/);
+    assert.equal(browsers.sessions.size, 0);
+    // An admitted origin still reaches the runtime, which is deliberately missing here.
+    await assert.rejects(browsers.run('origin-session', {action: 'navigate', url: 'https://example.com/deep/link'}, signal), /BROWSER_RUNTIME_MISSING/);
+    // Without a list nothing is refused: the same address only fails on the runtime.
+    const open = new BrowserSessions({executablePath: '/nonexistent/dsh-browser/chrome'});
+    try {
+      await assert.rejects(open.run('open-session', {action: 'navigate', url: 'https://example.com.evil.test/'}, signal), /BROWSER_RUNTIME_MISSING/);
+    } finally { await open.dispose(); }
+  } finally { await browsers.dispose(); }
+});
+
+test('the visit log keeps web addresses only, newest first and deduplicated', async () => {
+  const browsers = new BrowserSessions({});
+  const session = {visited: []};
+  let current = 'about:blank';
+  const page = {url: () => current, title: async () => 'Fixture'};
+  await browsers.visit(session, page);
+  assert.deepEqual(session.visited, []);
+  current = 'https://example.com/one?token=abcdefghi';
+  await browsers.visit(session, page);
+  assert.deepEqual(session.visited.map(item => item.url), ['https://example.com/one?token=[redacted]']);
+  assert.deepEqual(Object.keys(session.visited[0]).sort(), ['at', 'title', 'url']);
+  assert.equal(session.visited[0].title, 'Fixture');
+  assert.equal(typeof session.visited[0].at, 'number');
+  current = 'https://example.com/two';
+  await browsers.visit(session, page);
+  await browsers.visit(session, page);
+  assert.deepEqual(session.visited.map(item => item.url), ['https://example.com/two', 'https://example.com/one?token=[redacted]']);
+  // A title read while the page moves on belongs to the next address, not this record.
+  let raced = 'https://example.com/three';
+  await browsers.visit(session, {url: () => raced, title: async () => { raced = 'https://example.com/four'; return 'Three'; }});
+  assert.equal(session.visited[0].url, 'https://example.com/three');
+  assert.equal(session.visited[0].title, '');
+});
+
+test('a denied origin never enters the visit log', async () => {
+  const browsers = new BrowserSessions({allowedOrigins: ['https://example.com']});
+  const session = {visited: []};
+  await browsers.visit(session, {url: () => 'https://example.com/one', title: async () => 'One'});
+  await browsers.visit(session, {url: () => 'https://off-list.test/two', title: async () => 'Two'});
+  assert.deepEqual(session.visited.map(item => item.url), ['https://example.com/one']);
+});
+
+test('the visit log drops its oldest records at the cap', () => {
+  const visited = [];
+  for (let index = 0; index < VISITED_LIMIT + 20; index++) rememberVisit(visited, {url: `https://example.com/${index}`, title: '', at: index});
+  assert.equal(visited.length, VISITED_LIMIT);
+  assert.equal(visited[0].url, `https://example.com/${VISITED_LIMIT + 19}`);
+  assert.equal(visited.at(-1).url, 'https://example.com/20');
+  // Re-visiting a known address moves that one record to the front instead of adding another.
+  rememberVisit(visited, {url: 'https://example.com/20', title: 'again', at: 999});
+  assert.equal(visited.length, VISITED_LIMIT);
+  assert.equal(visited[0].title, 'again');
+  assert.equal(visited.filter(item => item.url === 'https://example.com/20').length, 1);
+});
+
+test('the visit log answers a pure read without starting a browser', async () => {
+  const browsers = new BrowserSessions({executablePath: '/nonexistent/dsh-browser/chrome'});
+  try {
+    assert.deepEqual(await browsers.run('quiet-session', {action: '_history'}, new AbortController().signal), {history: [], historyTotal: 0});
+    assert.equal(browsers.sessions.size, 0);
+    const session = {visited: [{url: 'https://example.com/', title: 'Example', at: 1}]};
+    assert.deepEqual(await browsers.operate(session, {action: '_history'}), {history: session.visited, historyTotal: 1});
+  } finally { await browsers.dispose(); }
+});
+
+test('the tab limit refuses an explicit new tab without evicting an open one', async () => {
+  const browsers = new BrowserSessions({});
+  const full = stubSession(Array.from({length: TAB_LIMIT}, (_, index) => stubTab(index + 1)));
+  await assert.rejects(browsers.operate(full, {action: '_tabs', op: 'new'}), /BROWSER_TAB_LIMIT/);
+  assert.equal(full.tabs.length, TAB_LIMIT);
+  assert.equal(full.tabs[0].id, 'tab-1');
+  const room = stubSession(Array.from({length: TAB_LIMIT - 1}, (_, index) => stubTab(index + 1)));
+  const created = await browsers.operate(room, {action: '_tabs', op: 'new'});
+  assert.equal(created.tabs.length, TAB_LIMIT);
+  assert.equal(created.activeId, created.tabs.at(-1).id);
+});
+
+test('a popup past the tab limit is closed instead of becoming a tab', async () => {
+  const browsers = new BrowserSessions({});
+  let closed = 0;
+  const popup = {...stubPage('http://127.0.0.1/popup'), close: async () => { closed += 1; }};
+  const full = stubSession(Array.from({length: TAB_LIMIT}, (_, index) => stubTab(index + 1)));
+  await browsers.adopt(full, popup);
+  assert.equal(closed, 1);
+  assert.equal(full.tabs.length, TAB_LIMIT);
+  // Below the limit the very same page becomes the tab the pane shows.
+  const room = stubSession(Array.from({length: TAB_LIMIT - 1}, (_, index) => stubTab(index + 1)));
+  await browsers.adopt(room, popup);
+  assert.equal(room.tabs.length, TAB_LIMIT);
+  assert.equal(room.tabs.at(-1).page, popup);
+  assert.equal(room.activeId, room.tabs.at(-1).id);
+});
+
+test('the pane reads the visit log through the read-only channel', async () => {
+  const routes = new Map();
+  let dispose;
+  apply({
+    effect: setup => { dispose = setup(); },
+    on() {},
+    tools: {register() {}},
+    inject: (_services, setup) => setup({
+      connection: {fetch: {register: route => { routes.set(route.path, route.fetch); }}},
+      sessions: {get: id => id === 'history-test' ? {id} : undefined},
+      get: name => name === 'sandboxPolicy' ? {resolve: () => ({mode: 'read-only'})} : undefined,
+    }),
+  }, {executablePath: '/nonexistent/dsh-browser/chrome'});
+  try {
+    const post = args => routes.get('/api/dsh-browser')(new Request('http://127.0.0.1/api/dsh-browser?sessionId=history-test', {method: 'POST', body: JSON.stringify(args)}));
+    const empty = await post({action: '_history'});
+    assert.equal(empty.status, 200);
+    assert.deepEqual(await empty.json(), {ok: true, history: [], historyTotal: 0});
+    // The visit log is a read, so a read-only Session may still ask for it while
+    // opening a tab stays denied.
+    assert.deepEqual(await (await post({action: '_tabs', op: 'new'})).json(), {error: 'BROWSER_READ_ONLY'});
   } finally { await dispose(); }
 });
 
