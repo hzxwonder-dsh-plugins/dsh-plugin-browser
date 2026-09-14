@@ -4,7 +4,7 @@
 
 - The `browser` tool runs Playwright Chromium in a Session-scoped context for automation, accessibility snapshots, and screenshots.
 - The `Browser` page in the Web right Sidebar uses the official Sidebar extension API to stream that same page live and forward pointer, keyboard, navigation, and scroll input.
-- The stream carries operation cues: Agent actions leave a pointer arrow with a caption, hovering outlines the element with its role and name, a focused field shows an outline and caret, and typed text echoes briefly.
+- The stream carries operation cues: Agent actions leave a mouse pointer with a caption, hovering outlines the element with its role and name, a focused field shows an outline and caret, and typed text echoes briefly.
 - The page reflows to the Sidebar's own size. Click, drag, scroll, double-click to select, paste, use an IME, and press Tab, arrows, or paging keys directly on the frame.
 
 The tool and Sidebar share cookies, storage, login state, and page history. Host automation remains headless by default while the Sidebar provides the visible surface. Enter passwords and MFA codes manually in the Sidebar; the tool never exports credentials.
@@ -13,7 +13,7 @@ The tool and Sidebar share cookies, storage, login state, and page history. Host
 
 ![Browser page in the right Sidebar](docs/screenshots/right-sidebar-browser.png)
 
-Figure: validation capture of a local fixture page inside the DSH Web right Sidebar, showing the focus outline, element caption, typed-text echo, and pointer arrow; see [`docs/screenshots/SOURCES.md`](docs/screenshots/SOURCES.md) for provenance and validation boundaries.
+Figure: validation capture of a local fixture page inside the DSH Web right Sidebar, showing the focus outline, element caption, typed-text echo, and mouse pointer; see [`docs/screenshots/SOURCES.md`](docs/screenshots/SOURCES.md) for provenance and validation boundaries.
 
 ## Install
 

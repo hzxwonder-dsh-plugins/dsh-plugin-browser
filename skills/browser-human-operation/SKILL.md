@@ -14,7 +14,7 @@ Use the `browser` tool to operate the page itself. A URL is only an address for 
 3. Perform one small action using the latest returned `observation` value. After any action that changes the page, observe again before the next targeted action.
 4. Verify the visible result with a new screenshot or snapshot. Report what was actually observed.
 
-The Web right Sidebar streams the same isolated Chromium session and annotates it: your clicks, inputs, keys, scrolls, and drags appear as a label led by a pointer arrow, and the field you focus shows its outline and caption. Humans can click the rendered frame and type into it, with a click ripple, a hover outline, and a focus outline showing them where input lands. Credentials, passwords, MFA codes, and private tokens must be entered by the human in that Sidebar; never extract or request them.
+The Web right Sidebar streams the same isolated Chromium session and annotates it: your clicks, inputs, keys, scrolls, and drags appear as a label led by a mouse pointer, and the field you focus shows its outline and caption. Humans can click the rendered frame and type into it, with a click ripple, a hover outline, and a focus outline showing them where input lands. Credentials, passwords, MFA codes, and private tokens must be entered by the human in that Sidebar; never extract or request them.
 
 ## Visual interaction
 

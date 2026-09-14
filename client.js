@@ -185,26 +185,31 @@ window.__ModuleLoader__.load({
       context.restore();
     }
 
-    /** The pointer glyph every desktop ships: a white arrow with a dark rim. */
-    function drawArrow(context, x, y, size, alpha) {
-      const points = [[0, 0], [0.238, 0.78], [0.412, 1.12], [0.6, 1.04], [0.42, 0.7], [0.72, 0.68]];
+    /** Shared mouse-cursor glyph, drawn with its outline so it reads on any page. */
+    const CURSOR_ICON = "M325.632 897.024c-7.168 0-14.336-1.024-21.504-3.072a73.728 73.728 0 0 1-53.76-66.56L205.824 207.36a75.1616 75.1616 0 0 1 117.248-67.584l514.56 348.672c26.112 17.92 38.4 49.152 30.72 80.384s-32.768 53.248-64.512 56.832l-250.88 29.184c-6.656 0.512-12.288 4.096-16.384 9.728s-151.04 202.752-151.04 202.752c-14.336 19.456-36.864 30.208-59.904 30.208zM281.088 177.664c-5.632 0-10.24 2.048-12.288 3.072-3.072 1.536-12.8 8.704-11.776 22.528l44.544 620.032c1.024 15.36 13.312 20.48 17.408 21.504 4.096 1.024 16.896 3.584 26.112-8.704l151.04-202.752c12.288-16.384 31.232-27.648 51.712-29.696l250.88-29.184c15.36-2.048 19.456-14.336 20.48-17.92 1.024-4.096 3.072-16.896-9.728-25.6L294.4 182.272a23.6032 23.6032 0 0 0-13.312-4.096z";
+    const CURSOR_TIP = [214, 196];
+    let cursorPath = null;
+
+    function drawCursor(context, x, y, size, alpha) {
+      if (!cursorPath) cursorPath = new Path2D(CURSOR_ICON);
+      const unit = size / 1024;
       context.save();
       context.globalAlpha = alpha;
-      context.translate(x, y);
-      context.scale(size, size);
-      context.beginPath();
-      context.moveTo(0, 0);
-      for (const [px, py] of points.slice(1)) context.lineTo(px, py);
-      context.closePath();
-      context.fillStyle = "#fff";
-      context.shadowColor = "rgba(0, 0, 0, 0.45)";
-      context.shadowBlur = 0.14;
-      context.shadowOffsetY = 0.05;
-      context.fill();
+      context.translate(x - CURSOR_TIP[0] * unit, y - CURSOR_TIP[1] * unit);
+      context.scale(unit, unit);
+      context.lineJoin = "round";
+      context.shadowColor = "rgba(12, 16, 20, 0.35)";
+      context.shadowBlur = 150;
+      context.shadowOffsetY = 60;
+      context.strokeStyle = "rgba(255, 255, 255, 0.95)";
+      context.lineWidth = 104;
+      context.stroke(cursorPath);
       context.shadowColor = "transparent";
-      context.lineWidth = 0.075;
-      context.strokeStyle = "rgba(12, 16, 20, 0.85)";
-      context.stroke();
+      context.fillStyle = "#bfbfbf";
+      context.fill(cursorPath);
+      context.strokeStyle = "rgba(23, 25, 28, 0.4)";
+      context.lineWidth = 30;
+      context.stroke(cursorPath);
       context.restore();
     }
 
@@ -296,8 +301,8 @@ window.__ModuleLoader__.load({
         const x = (pointer.fromX + (pointer.x - pointer.fromX) * eased) * scale;
         const y = (pointer.fromY + (pointer.y - pointer.fromY) * eased) * scale;
         const alpha = Math.max(0.25, 1 - Math.max(0, age - POINTER_HOLD_MS) / POINTER_FADE_MS);
-        drawArrow(context, x, y, Math.max(16, Math.min(26, canvas.width / 42)), alpha);
-        drawChip(context, pointer.label, x + 18, y + 16, alpha, canvas);
+        drawCursor(context, x, y, Math.max(28, Math.min(46, canvas.width / 17)), alpha);
+        drawChip(context, pointer.label, x + 20, y + 18, alpha, canvas);
         if (travel < 1) drawRing(context, x, y, 6 + 10 * eased, (1 - travel) * 0.5, 2);
       }
       const ripple = state.ripple;

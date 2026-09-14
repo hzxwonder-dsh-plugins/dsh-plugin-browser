@@ -9,7 +9,7 @@
 文件 SHA-256：
 
 ```text
-08af7956cfb11cf36a700aa598d169fde719331f6b00c1a2d813a47c7fed94d8  right-sidebar-browser.png
+aaa196c52c8955be28a5e4484ee108a5a25a6597146bca9676d5590a2015b921  right-sidebar-browser.png
 ```
 
 截图取自本机临时 fixture 页面（`127.0.0.1` 本地端口）与合成数据，不连接真实账户或外部站点，并对整屏图像做了右侧面板裁剪；自动化引擎与串流行为由插件测试覆盖。
