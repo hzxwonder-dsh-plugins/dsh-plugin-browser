@@ -1,6 +1,6 @@
 {
   "name": "dsh-plugin-browser",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Session-isolated Playwright browser tools for DeepSeek Harness",
   "type": "module",
   "main": "index.js",
@@ -8,7 +8,7 @@
     ".": "./index.js",
     "./client": "./client.js"
   },
-  "files": ["index.js", "browser.js", "client.js", "cordis.patch.yml", "README.md", "LICENSE", "NOTICE", "docs"],
+  "files": ["index.js", "browser.js", "client.js", "skills", "cordis.patch.yml", "README.md", "README.en.md", "LICENSE", "NOTICE", "docs"],
   "scripts": {"test": "node --test test/*.test.js", "browser:install": "playwright install chromium"},
   "engines": {"node": ">=22.19.0"},
   "license": "LGPL-3.0-only",
