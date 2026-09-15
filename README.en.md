@@ -13,6 +13,15 @@
 
 The tool and Sidebar share cookies, storage, login state, and page history. Host automation remains headless by default while the Sidebar provides the visible surface. Enter passwords and MFA codes manually in the Sidebar; the tool never exports credentials.
 
+## Host support
+
+- Both hosts use one package, `dsh-plugin-browser`; there is no desktop-only package.
+- Web: the right Sidebar `Browser` page streams the Session-isolated Chromium page over a CDP screencast.
+- Desktop: when the host provides the `desktopNativeBrowser` service, the same pane instead reports the page's position, zoom, and visibility to the host, and a native view in the Electron main process carries the page — no encoded stream, native resolution, pointer and keyboard input reaching the page directly. A missing service or a failure falls back to the streaming pane.
+- The desktop-only capability is probed at runtime with `ctx.get?.('desktopNativeBrowser')` and stays out of the top-level `inject`, so an ordinary Web host loads the plugin as usual; this follows the ["Compatible with Desktop and plain DSH"](https://github.com/anywhere-labs/dsh-desktop/blob/master/docs/plugin-development.md) pattern of the anywhere-labs/dsh-desktop plugin guide.
+- Verification: the desktop side is measured on a live DSH Desktop instance (2026-09-15: the agent's `browser` tool opening a page and reading back its title and accessibility snapshot, the geometry and zoom of both the Sidebar and main-area surfaces, and the visibility while the pane menu is open); on the Web side 42 of 44 acceptance checks pass, and the other two need `BROWSER_TEST_EXECUTABLE` pointing at a local Chrome.
+- The desktop side keeps no separate repository; one implementation in this repository serves both hosts.
+
 ## Feature screenshot
 
 ![Browser page in the right Sidebar](docs/screenshots/right-sidebar-browser.png)

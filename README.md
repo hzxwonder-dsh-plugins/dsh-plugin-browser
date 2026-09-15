@@ -13,6 +13,15 @@
 
 工具和右侧栏共享 Cookie、Storage、登录状态与页面历史；Host 自动化仍默认无头运行，右侧栏提供可见操作面板。密码和 MFA 由用户在右侧栏手动输入，工具不会导出凭据。
 
+## 宿主支持
+
+- 两端共用同一个包 `dsh-plugin-browser`，没有桌面端专用包。
+- Web 端：右侧栏 `浏览器` 页面用 CDP screencast 串流按 Session 隔离的 Chromium 页面。
+- 桌面端：宿主提供 `desktopNativeBrowser` 服务时，同一个面板改为把页面位置、缩放与可见性上报给宿主，由 Electron 主进程的原生视图承载页面（无编码串流、原生分辨率、鼠标键盘直达页面）；服务缺失或失败时自动回退到串流面板。
+- 桌面专属能力只用 `ctx.get?.('desktopNativeBrowser')` 在运行时探测，不放进顶层 `inject`，普通 Web 宿主照常加载；这符合 anywhere-labs/dsh-desktop 插件规范的[「兼容 Desktop 和普通 DSH」](https://github.com/anywhere-labs/dsh-desktop/blob/master/docs/plugin-development.md)写法。
+- 验证：桌面端已在 DSH Desktop 实例上实测（2026-09-15：agent 的 `browser` 工具打开页面取回标题与可访问性快照、右侧栏与主页区两个承载面的几何与缩放、面板菜单展开时的可见性）；Web 端验收 44 条中 42 条通过，另 2 条需要 `BROWSER_TEST_EXECUTABLE` 指向本机 Chrome。
+- 桌面端没有需要单独维护的仓库，两端由本仓库同一份实现维护。
+
 ## 功能截图
 
 ![右侧栏浏览器页面](docs/screenshots/right-sidebar-browser.png)
