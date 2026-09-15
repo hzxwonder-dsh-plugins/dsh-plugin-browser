@@ -9,6 +9,7 @@
 - Focusing the address field opens `Visited pages`, listing the pages this Session has visited, newest first; a row returns to that page, and an empty log shows a placeholder.
 - The stream carries operation cues: Agent actions leave a mouse pointer with a caption, hovering outlines the element with its role and name, a focused field shows an outline and caret, and typed text echoes briefly.
 - Layout switches between a desktop viewport and the Sidebar width, with zoom steps. Click, drag, scroll, double-click to select, paste, use an IME, and press Tab, arrows, or paging keys directly on the frame.
+- On a host that owns its window through an Electron main process, such as DSH Desktop, the pane instead reports where the page goes, how far it is zoomed and whether it is on screen, and a native view carries the real page: no encoding, no frame stream, text at native resolution, and pointer and keyboard input that reaches the page directly. Any failure falls back to the streaming pane.
 
 The tool and Sidebar share cookies, storage, login state, and page history. Host automation remains headless by default while the Sidebar provides the visible surface. Enter passwords and MFA codes manually in the Sidebar; the tool never exports credentials.
 
@@ -75,6 +76,15 @@ After the Web client extension is installed, the right Sidebar registers a `Brow
 
 The page accepts credential-free HTTP(S) addresses and streams Chromium through the authenticated Host interface, including sites that deny iframe embedding; the Sidebar tab and the main-area panel are the same page, and only the visible one requests frames. Frames arrive as CDP events, so a still page costs no traffic and actions update immediately; a two-second heartbeat reports whether frames are still produced, and the pane marks the picture paused once they stop. When the stream is unavailable the pane falls back to one-shot captures, marks the toolbar `Compatibility view`, and keeps retrying. Human input is stored as a fraction of the picture, so a layout or zoom change never moves a click elsewhere. User input invalidates the tool observation; take another snapshot before tool input. Audio/video streaming, downloads, and credential export are unavailable.
 
+## Desktop native surface
+
+On a host that owns its window through an Electron main process, such as DSH Desktop, the same page can be carried by a native view and drawn by the window compositor. The host picks the transport when the Session's first tab is created and reports it to the client as `transport` in the panel state:
+
+- `native` — the picture comes from the compositor: no encoding, no frame stream, no canvas. Text is drawn at native resolution, pointer and keyboard input reach the page directly, and the pane forwards no input of its own.
+- `screencast` — the streaming pane of today. The Web GUI, a remote Host, a read-only Session, and any native failure stay on, or fall back to, this one.
+
+Under native transport the pane owns only the hole: it measures the rectangle the native view should fill (CSS pixels, relative to the renderer viewport), the zoom factor, and whether the page is on screen, coalesces those measurements through `ResizeObserver` and `requestAnimationFrame`, and reports them only when one of them changed. `Fit Sidebar width` hands the whole stage to the page at 100%; `Desktop layout (1280 wide)` reports the rectangle of the picture the pane used to scale into the stage, with the zoom as the hole's width over the logical width, so the zoom steps keep working. A window resize, a collapsing Sidebar, a bottom panel opening or closing, a Session or tab switch, and a move between the Sidebar tab and the main-area panel are all measured again. A tab that is not visible, a surface that has been switched away, a collapsed Sidebar, an open `⋯` tools menu, visit log, or context menu, and an expanded error row are all reported as not visible, so the host takes the native view away instead of leaving the page floating over the pane's own chrome. Any failure tears the native view down and falls back to the stream: the panel never shows two pictures of one page, and tabs, visit log, and page state stay the same page on both surfaces.
+
 ## The `browser` tool
 
 Supported actions are `navigate`, `snapshot`, `screenshot`, `click`, `fill`, `press`, `scroll`, `tabs`, `console`, `evaluate`, and `close`. `tabs` takes an `op` of `list`, `new`, `select`, or `close` plus a `tab` id; `list` is a pure read, while switching or closing a tab invalidates the older observation.
@@ -124,7 +134,7 @@ npm test
 BROWSER_TEST_EXECUTABLE=/path/to/chrome npm test
 ```
 
-The tests start a local HTTP fixture and cover navigation, form input, stale-observation rejection, console output, screenshots, fixed inspections, Session isolation, and the Sidebar stream with its frame, pointer, focus, drag, and coordinate-click events. The same suite covers opening, switching, and closing tabs, a site popup becoming a tab, history state for Back and Forward, stopping a slow load, and reading the page selection. Normalizing and enforcing `allowedOrigins`, recording the visit log with its deduplication and bound, and the tab limit with an over-limit popup are covered as well. Harness Web Sidebar activation and native attachment rendering are separate integration checks; see [`docs/e2e.md`](docs/e2e.md).
+The tests start a local HTTP fixture and cover navigation, form input, stale-observation rejection, console output, screenshots, fixed inspections, Session isolation, and the Sidebar stream with its frame, pointer, focus, drag, and coordinate-click events. The same suite covers opening, switching, and closing tabs, a site popup becoming a tab, history state for Back and Forward, stopping a slow load, and reading the page selection. Normalizing and enforcing `allowedOrigins`, recording the visit log with its deduplication and bound, and the tab limit with an over-limit popup are covered as well. `test/client-native.test.js` renders the real client against a stub of the plugin API and covers the geometry, zoom, and visibility it reports under native transport, plus the return to streaming, without needing a host. Harness Web Sidebar activation and native attachment rendering are separate integration checks; see [`docs/e2e.md`](docs/e2e.md).
 
 ## Development docs
 

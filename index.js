@@ -8,7 +8,11 @@ export const name = 'dsh-plugin-browser';
 export const inject = ['tools', 'attachments', 'skills'];
 
 export function apply(ctx, config = {}) {
-  const browsers = new BrowserSessions(config);
+  // The desktop shell may expose a native browser surface; a deployment without
+  // one keeps the Playwright backend, so the probe stays optional and late: the
+  // shell's plugin may be applied after this one.
+  const nativeService = ctx.get?.('desktopNativeBrowser');
+  const browsers = new BrowserSessions({...config, nativeService, resolveNativeService: () => ctx.get?.('desktopNativeBrowser')});
   ctx.skills?.register({name: 'browser-human-operation', description: 'Operate webpages like a human through visual observation and pointer/keyboard actions', content: humanOperationSkill, source: 'bundled'});
   ctx.effect(() => () => browsers.dispose());
   ctx.on('session/disposed', session => { void browsers.close(session.id).catch(() => {}); });
@@ -32,7 +36,11 @@ export function apply(ctx, config = {}) {
           const raw = await request.text();
           if (Buffer.byteLength(raw) > 20000) throw new Error('BROWSER_INPUT_TOO_LARGE');
           const args = JSON.parse(raw);
-          if (!['navigate', 'close', '_input', '_hover', '_back', '_forward', '_reload', '_tabs', '_stop', '_selection', '_history'].includes(args?.action)) throw new Error('BROWSER_INVALID_ACTION');
+          if (!['navigate', 'close', '_input', '_hover', '_back', '_forward', '_reload', '_tabs', '_stop', '_selection', '_history', 'viewport'].includes(args?.action)) throw new Error('BROWSER_INVALID_ACTION');
+          // Placing the pane's native view is presentation rather than a page
+          // mutation, so a read-only Session ignores it instead of failing the
+          // pane's own layout call.
+          if (args.action === 'viewport' && web.get('sandboxPolicy')?.resolve({session})?.mode === 'read-only') return Response.json({ok: true, ignored: true}, {headers});
           // Reads — the hover cue, the tab list, the page selection, the visit
           // log — stay available in a read-only Session; every mutation is denied.
           if (!['_hover', '_selection', '_stop', '_history'].includes(args.action) && !(args.action === '_tabs' && (args.op === undefined || args.op === 'list')) && web.get('sandboxPolicy')?.resolve({session})?.mode === 'read-only') throw new Error('BROWSER_READ_ONLY');

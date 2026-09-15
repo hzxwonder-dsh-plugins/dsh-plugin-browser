@@ -105,9 +105,20 @@ function activeTab(session) {
 }
 
 /** Pane actions that answer without waiting for the action queue. */
-const CONTROL_ACTIONS = new Set(['_view', '_hover', '_selection', '_history', '_stop']);
+const CONTROL_ACTIONS = new Set(['_view', '_hover', '_selection', '_history', '_stop', 'viewport']);
 
 const SCREENCAST_QUALITY = 62;
+
+/**
+ * The optional native backend module. A deployment without a desktop browser
+ * surface never loads it, and a build that ships without native.js keeps the
+ * Playwright backend instead of failing the whole import.
+ */
+let nativeModule;
+async function nativeBackend() {
+  if (nativeModule === undefined) nativeModule = await import('./native.js').catch(() => null);
+  return nativeModule?.createNativeBackend;
+}
 
 /**
  * One subscriber's bounded event queue. Frames are latest-wins, so a slow
@@ -153,10 +164,20 @@ class Subscriber {
 export class BrowserSessions {
   constructor(config = {}) {
     this.config = config;
+    this.nativeService = config.nativeService;
+    // The desktop shell's plugin may be applied after this one, so the service is
+    // looked up again whenever a Session picks its backend.
+    this.resolveNativeService = config.resolveNativeService;
+    this.logger = config.logger;
     this.allowedOrigins = originPolicy(config.allowedOrigins ?? []);
     this.sessions = new Map();
     this.queues = new Map();
     this.closed = false;
+  }
+
+  /** The desktop shell's native browser surface, when this deployment has one. */
+  surface() {
+    return this.resolveNativeService?.() ?? this.nativeService;
   }
 
   async browser() {
@@ -183,18 +204,48 @@ export class BrowserSessions {
     if (this.sessions.has(id)) return this.sessions.get(id);
     if (this.sessions.size >= 8) throw new Error('BROWSER_SESSION_LIMIT: close an unused session browser');
     const pending = (async () => {
-      // Permissions are cleared and downloads never land: the Agent drives pages
-      // it does not own, so no site may reach the camera, the microphone, the
-      // location or the clipboard, and no response may write a file to disk
-      // behind the operator's back. Service workers stay blocked for the same
-      // reason — nothing of the site survives the tab that loaded it.
-      const context = await (await this.browser()).newContext({viewport: {width: 1280, height: 800}, deviceScaleFactor: 2, acceptDownloads: false, serviceWorkers: 'block'});
-      await context.clearPermissions();
-      await context.route('**/*', route => {
-        try { httpUrl(route.request().url()); return route.continue(); } catch { return route.abort(); }
-      });
-      const session = {
-        context, observation: 0, tabSeq: 0, tabs: [], activeId: undefined, visited: [],
+      // A desktop shell may provide the native browser surface. One session has
+      // exactly one backend, so a native backend that cannot be created falls
+      // back to Playwright instead of leaving the pane without a page.
+      let session;
+      let backend;
+      let context;
+      const surface = this.surface();
+      if (surface) {
+        try {
+          const createNativeBackend = await nativeBackend();
+          if (!createNativeBackend) throw new Error('BROWSER_VIEW_UNAVAILABLE: native backend module is missing');
+          backend = await createNativeBackend({
+            service: surface,
+            // One Session's tabs are one owner: the shell isolates their session
+            // partition from every other Session and releases them together.
+            config: {...this.config, owner: id},
+            logger: this.logger,
+            emit: event => { if (session) this.emit(session, event); },
+          });
+          // The backend normally exposes the context facade itself; one that
+          // only builds pages is adapted to the same shape.
+          context = backend.context ?? {newPage: options => backend.newPage(options), close: () => backend.close()};
+        } catch (error) {
+          const log = this.logger?.error ? this.logger : console;
+          log.error(`BROWSER_NATIVE_FALLBACK: ${String(error?.message ?? error)}`);
+          backend = undefined;
+        }
+      }
+      if (!context) {
+        // Permissions are cleared and downloads never land: the Agent drives pages
+        // it does not own, so no site may reach the camera, the microphone, the
+        // location or the clipboard, and no response may write a file to disk
+        // behind the operator's back. Service workers stay blocked for the same
+        // reason — nothing of the site survives the tab that loaded it.
+        context = await (await this.browser()).newContext({viewport: {width: 1280, height: 800}, deviceScaleFactor: 2, acceptDownloads: false, serviceWorkers: 'block'});
+        await context.clearPermissions();
+        await context.route('**/*', route => {
+          try { httpUrl(route.request().url()); return route.continue(); } catch { return route.abort(); }
+        });
+      }
+      session = {
+        context, native: backend ?? null, observation: 0, tabSeq: 0, tabs: [], activeId: undefined, visited: [],
         subscribers: new Set(), screencast: false, streamingId: undefined, pattern: 0,
         pointer: undefined, viewport: {width: 1280, height: 800},
       };
@@ -210,8 +261,8 @@ export class BrowserSessions {
       await this.openTab(session, await context.newPage());
       // A page the site opened by itself (target=_blank, window.open) becomes
       // a managed tab in the pane instead of an invisible extra window.
-      context.on('page', popup => { void this.adopt(session, popup).catch(() => {}); });
-      context.on('close', () => { session.subscribers.forEach(subscriber => subscriber.close()); });
+      context.on?.('page', popup => { void this.adopt(session, popup).catch(() => {}); });
+      context.on?.('close', () => { session.subscribers.forEach(subscriber => subscriber.close()); });
       return session;
     })();
     this.sessions.set(id, pending);
@@ -229,6 +280,7 @@ export class BrowserSessions {
       t: 'state', active: true, tabId: session.activeId, url: session.page.url(),
       observation: session.observation, loading: session.loading,
       canGoBack: session.canGoBack, canGoForward: session.canGoForward,
+      transport: session.native ? 'native' : 'screencast',
     });
   }
 
@@ -418,6 +470,9 @@ export class BrowserSessions {
    * old page's stream and starts the new one, so pictures never mix.
    */
   async screencast(session, on) {
+    // The native backend paints the page itself, so a native session has no
+    // frames to produce and nothing to start or stop.
+    if (session.native) return;
     const entry = on ? activeTab(session) : undefined;
     if (session.streamingId === entry?.id) return;
     const previous = session.tabs.find(tab => tab.id === session.streamingId);
@@ -444,6 +499,9 @@ export class BrowserSessions {
 
   /** One CDP session per tab, created on first use. */
   async attach(session, entry) {
+    // A native page has no CDP session here: the desktop shell owns the
+    // transport of its own view, so there is nothing to attach to.
+    if (session.native) return undefined;
     if (entry.cdp) return entry.cdp;
     const cdp = await session.context.newCDPSession(entry.page);
     cdp.on('Page.screencastFrame', frame => {
@@ -546,6 +604,9 @@ export class BrowserSessions {
     // The visit log of a session without a browser is empty, and answering that
     // directly keeps a pure read from launching Chromium just to say so.
     if (args.action === '_history' && !this.sessions.has(id)) return {history: [], historyTotal: 0};
+    // A deployment without a native browser surface has no view to place, and a
+    // pane resize must never launch Chromium just to be ignored.
+    if (args.action === 'viewport' && !this.surface()) return {ok: true, ignored: true};
     // The pane's control plane — looking at the page, reading its selection or
     // its visit log, and stopping a load — answers while a slow navigation is
     // still in flight, exactly like a browser's own stop and reload buttons.
@@ -583,18 +644,44 @@ export class BrowserSessions {
 
   async operate(session, args) {
     const {page} = session;
+    if (args.action === 'viewport') {
+      // The pane's own geometry places the desktop shell's native view; a
+      // session on the Playwright backend has no view to place and ignores it.
+      if (!session.native) return {ok: true, ignored: true};
+      if (typeof session.native.setViewport !== 'function') throw new Error('BROWSER_VIEW_UNAVAILABLE: native backend has no setViewport');
+      const bounds = args.bounds ?? null;
+      const factor = Number(args.zoom);
+      await session.native.setViewport({bounds, zoom: args.zoom, visible: args.visible}, page);
+      // The shell zooms the view, so the page's real viewport is the hole divided
+      // by that zoom: that quotient is the size every Agent coordinate is in.
+      if (bounds && factor > 0) {
+        const next = viewportBounds(Math.round(bounds.width / factor), Math.round(bounds.height / factor));
+        if (next.width !== session.viewport.width || next.height !== session.viewport.height) {
+          session.viewport = next;
+          session.observation++;
+          this.emitState(session);
+        }
+      }
+      return {ok: true, transport: 'native', ...session.viewport};
+    }
     if (args.action === '_view') {
       // A plain picture poll never consumes an observation: only a real
       // viewport change does, so polling cannot invalidate the Agent's counter.
       if (args.width !== undefined || args.height !== undefined) await this.viewport(session, {width: args.width, height: args.height});
-      const data = await page.screenshot({type: 'jpeg', quality: 62, timeout: 5000});
-      session.pattern += 1;
-      return {
-        active: true, image: data.toString('base64'), mediaType: 'image/jpeg', url: page.url(), title: await page.title(),
+      const native = Boolean(session.native);
+      const state = {
+        active: true, url: page.url(), title: await page.title(),
         tab: session.activeId, tabs: this.tabList(session), loading: session.loading,
         canGoBack: session.canGoBack, canGoForward: session.canGoForward,
+        transport: native ? 'native' : 'screencast',
         ...session.viewport, observation: session.observation, seq: session.pattern,
       };
+      // The desktop shell paints the page itself, so a native read answers the
+      // pane without encoding a picture the pane will not show.
+      if (native) return state;
+      const data = await page.screenshot({type: 'jpeg', quality: 62, timeout: 5000});
+      session.pattern += 1;
+      return {...state, image: data.toString('base64'), mediaType: 'image/jpeg', seq: session.pattern};
     }
     if (args.action === '_history') {
       // A pure read of this session's own visit log: the pane shows where this
@@ -765,6 +852,9 @@ export class BrowserSessions {
       await tab.cdp?.detach().catch(() => {});
     }
     await session.context.close();
+    // A native backend owns the desktop view and its service subscription;
+    // releasing it is idempotent when the context facade already did.
+    await session.native?.close();
   }
 
   async dispose() {

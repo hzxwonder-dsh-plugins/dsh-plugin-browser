@@ -20,6 +20,14 @@ window.__ModuleLoader__.load({
     const POLL_MS = 900;
     const STREAM_RETRY_MS = 1500;
     const STREAM_REATTACH_POLLS = 12;
+    /** How often a native surface reads the panel state: with the page on the
+     * compositor there are no frame events, so the tabs, the address, the
+     * loading flag and a fall back to frames all arrive on this beat. */
+    const NATIVE_STATE_MS = 3000;
+    /** How long the pane waits between transport reads while it has no page. */
+    const TRANSPORT_RETRY_MS = 2000;
+    /** How long a leaving surface waits before it takes the guest view away. */
+    const NATIVE_RELEASE_MS = 250;
     /** Zoom steps a real browser offers, applied to the layout width. */
     const ZOOM_STEPS = [0.5, 0.67, 0.8, 0.9, 1, 1.1, 1.25, 1.5, 1.75, 2];
     /** Logical width of the desktop layout the pane asks the Host for. */
@@ -99,6 +107,9 @@ window.__ModuleLoader__.load({
         "dismiss": "Dismiss",
         "err.origin": "That address is outside the origins this deployment allows.",
         "err.limit": "This Session already holds its maximum tabs. Close one before opening another.",
+        "err.view": "The desktop window cannot show the page right now.",
+        "err.viewGone": "The page surface is gone; the tab will be reopened.",
+        "err.viewDenied": "The browser refused that page operation.",
       },
       zh: {
         "browser": "浏览器",
@@ -168,6 +179,9 @@ window.__ModuleLoader__.load({
         "dismiss": "关闭提示",
         "err.origin": "该地址不在本部署允许的来源内，已拒绝打开。",
         "err.limit": "本会话的标签页已达上限，请先关闭一个再新建。",
+        "err.view": "桌面窗口暂时无法显示该页面。",
+        "err.viewGone": "承载面已失效，将重新打开该标签页。",
+        "err.viewDenied": "浏览器拒绝了该页面操作。",
       },
     };
     const ERROR_KEYS = {
@@ -188,6 +202,9 @@ window.__ModuleLoader__.load({
       BROWSER_UNKNOWN_TAB: "err.tab",
       BROWSER_ORIGIN_DENIED: "err.origin",
       BROWSER_TAB_LIMIT: "err.limit",
+      BROWSER_VIEW_UNAVAILABLE: "err.view",
+      BROWSER_VIEW_UNKNOWN: "err.viewGone",
+      BROWSER_VIEW_CDP_DENIED: "err.viewDenied",
     };
     const AGENT_LABELS = {click: "agentClick", fill: "agentFill", press: "agentPress", scroll: "agentScroll", drag: "agentDrag", navigate: "agentNavigate"};
     const HUMAN_LABELS = {click: "humanClick", drag: "humanDrag", scroll: "humanScroll"};
@@ -213,6 +230,13 @@ window.__ModuleLoader__.load({
     function errorKey(error) {
       const code = /^BROWSER_[A-Z_]+/.exec(String(error?.message ?? error))?.[0];
       return ERROR_KEYS[code] ?? "err.request";
+    }
+
+    /** Whether a measured hole equals the one already reported. */
+    function sameBounds(left, right) {
+      if (left === right) return true;
+      if (!left || !right) return false;
+      return left.x === right.x && left.y === right.y && left.width === right.width && left.height === right.height;
     }
 
     function decodeBase64(value) {
@@ -395,6 +419,14 @@ window.__ModuleLoader__.load({
     }
 
     /**
+     * The surface that owns the guest view. A surface on its way out only takes
+     * the view away while no newer surface has claimed it, so moving the page
+     * between the Sidebar and the main area never leaves it hidden.
+     */
+    let nativeOwner = 0;
+    let nativeClaim = 0;
+
+    /**
      * The browser chrome both surfaces share. The Sidebar pane and the
      * main-area panel are the same component against one Session, so a page
      * opened in either place is the same page, with the same tabs and history.
@@ -417,6 +449,9 @@ window.__ModuleLoader__.load({
       const [stale, setStale] = React.useState(false);
       const [history, setHistory] = React.useState([]);
       const [historyOpen, setHistoryOpen] = React.useState(false);
+      /** The transport the Host carries this page on: `native` means the shell
+       * composites a real view and the pane only places it. */
+      const [transport, setTransport] = React.useState(undefined);
       const stage = React.useRef(null);
       const surface = React.useRef(null);
       const overlay = React.useRef(null);
@@ -447,10 +482,23 @@ window.__ModuleLoader__.load({
       const polls = React.useRef(0);
       const beat = React.useRef({at: 0, off: 0});
       const noteTimer = React.useRef(0);
+      /** The hole the guest view fills, as last measured from the stage. */
+      const geometry = React.useRef(undefined);
+      /** The measure pass the native reports read from, replaced every layout. */
+      const remeasure = React.useRef(undefined);
+      /** What the Host was last told, so an unchanged hole costs no request. */
+      const reported = React.useRef({sent: false, bounds: null, zoom: 1, visible: false});
+      const pendingReport = React.useRef(0);
       const layout = React.useRef({zoom: 1, desktop: true});
       layout.current = {zoom, desktop};
       const endpoint = `/api/dsh-browser?sessionId=${encodeURIComponent(sessionId)}`;
       const streamEndpoint = `/api/dsh-browser/stream?sessionId=${encodeURIComponent(sessionId)}`;
+      const native = transport === "native";
+      const empty = !active;
+      // The guest view floats above everything the renderer paints, so the pane
+      // takes it away while its own chrome covers the stage instead of leaving
+      // the page floating over a menu, the visit log or an error row.
+      const occluded = !visible || empty || menu !== undefined || historyOpen || Boolean(error);
 
       /** Show a short-lived hint inside the pane, the way a browser shows toast
        * confirmations for copying and clipboard failures. */
@@ -458,6 +506,36 @@ window.__ModuleLoader__.load({
         setNote(text);
         clearTimeout(noteTimer.current);
         noteTimer.current = setTimeout(() => setNote(""), 2200);
+      }, []);
+
+      /** The Host picks the transport, so the pane takes it from every payload
+       * it sees: a state read, an action answer or a stream event. */
+      const readTransport = React.useCallback(value => {
+        if (value?.transport !== "native" && value?.transport !== "screencast") return false;
+        setTransport(value.transport);
+        return true;
+      }, []);
+
+      /** One panel state read, without a size: a read never resizes the Host's
+       * viewport, and it answers what the pane cannot see without frames. */
+      const readState = React.useCallback(async () => {
+        const response = await fetch(endpoint, {cache: "no-store"});
+        const value = await response.json().catch(() => ({}));
+        if (!response.ok) throw new Error(value.error || "BROWSER_REQUEST_FAILED");
+        return value;
+      }, [endpoint]);
+
+      /** Adopt a state read the way the stream's hello does. With the shell
+       * compositing the page this is what keeps the chrome current: the address,
+       * the tabs, the loading flag and the observation counter. */
+      const adopt = React.useCallback(value => {
+        if (value?.active === false) { setActive(false); setLoading(false); return; }
+        setActive(true);
+        if (value.observation) observation.current = Math.max(observation.current, value.observation);
+        if (typeof value.url === "string" && !editing.current) setAddress(value.url === "about:blank" ? "" : value.url);
+        if (value.tabs) setTabs(value.tabs);
+        if (value.loading !== undefined) setLoading(Boolean(value.loading));
+        if (value.canGoBack !== undefined) setNav({canGoBack: Boolean(value.canGoBack), canGoForward: Boolean(value.canGoForward)});
       }, []);
 
       const paint = React.useCallback(() => {
@@ -472,9 +550,10 @@ window.__ModuleLoader__.load({
       }, [copy]);
 
       // One animation clock: frames arrive on the wire, annotations repaint at
-      // 30fps only while a page is on screen to annotate.
+      // 30fps only while a page is on screen to annotate. A native page is
+      // painted by the shell, so there is nothing to repaint here.
       React.useEffect(() => {
-        if (!visible || !active) return undefined;
+        if (!visible || !active || native) return undefined;
         let raf = 0;
         let last = 0;
         const tick = now => {
@@ -485,7 +564,7 @@ window.__ModuleLoader__.load({
         };
         raf = requestAnimationFrame(tick);
         return () => cancelAnimationFrame(raf);
-      }, [visible, active, paint]);
+      }, [visible, active, native, paint]);
 
       React.useEffect(() => () => clearTimeout(wheelTimer.current), []);
 
@@ -518,6 +597,8 @@ window.__ModuleLoader__.load({
       }, [paint]);
 
       const handleEvent = React.useCallback(event => {
+        // A Host that names the transport only on its stream is still heard.
+        readTransport(event);
         // Events carry the counter they were produced with, so the pane never
         // sends input against a page that has already moved past it.
         if (event.observation) observation.current = Math.max(observation.current, event.observation);
@@ -575,12 +656,13 @@ window.__ModuleLoader__.load({
           return;
         }
         if (event.t === "error") setError(copy(ERROR_KEYS[event.code] ?? "err.request"));
-      }, [copy, drawFrame]);
+      }, [copy, drawFrame, readTransport]);
 
       // The stream is the primary picture; polling only covers a Host without
       // the streaming route or a carrier that cannot hold a response open.
+      // A native page is composited by the shell, so neither path is subscribed.
       React.useEffect(() => {
-        if (!visible || !sessionId || mode !== "stream") return undefined;
+        if (transport !== "screencast" || !visible || !sessionId || mode !== "stream") return undefined;
         const controller = new AbortController();
         const connect = async () => {
           try {
@@ -613,13 +695,13 @@ window.__ModuleLoader__.load({
         };
         void connect();
         return () => { controller.abort(); };
-      }, [visible, sessionId, size, mode, streamEndpoint, handleEvent]);
+      }, [transport, visible, sessionId, size, mode, streamEndpoint, handleEvent]);
 
       // Compatibility view: the one-shot JPEG poll, used while the stream is
       // unavailable. It periodically re-attempts the stream, so a pane returns
       // to live frames as soon as the streaming route answers again.
       React.useEffect(() => {
-        if (!visible || !sessionId || mode !== "poll") return undefined;
+        if (transport !== "screencast" || !visible || !sessionId || mode !== "poll") return undefined;
         const controller = new AbortController();
         let timer;
         const poll = async () => {
@@ -651,7 +733,32 @@ window.__ModuleLoader__.load({
         };
         void poll();
         return () => { controller.abort(); clearTimeout(timer); };
-      }, [visible, sessionId, size, mode, endpoint, copy, drawFrame]);
+      }, [transport, visible, sessionId, size, mode, endpoint, copy, drawFrame]);
+
+      // Which transport carries the page is the Host's choice, made when the
+      // Session's first tab is created. The pane asks before it subscribes to
+      // anything, so a native Session never opens a frame stream; a Host that
+      // never mentions the field is the Web one, and the pane stays exactly the
+      // streaming pane it is today. A surface that is not on screen still asks
+      // once, because the shell has to be told that its view is not shown.
+      React.useEffect(() => {
+        if (!sessionId || transport !== undefined) return undefined;
+        let stopped = false;
+        let timer;
+        let failures = 0;
+        const probe = async () => {
+          let value;
+          try { value = await readState(); failures = 0; } catch { failures += 1; }
+          if (stopped || readTransport(value)) return;
+          // A live page that says nothing about the transport is the screencast
+          // one; an idle Session keeps being asked, at no cost, until it has
+          // one, while an off-screen pane waits for its turn instead.
+          if (failures >= 2 || value?.active === true) { setTransport("screencast"); return; }
+          if (visible) timer = setTimeout(probe, TRANSPORT_RETRY_MS);
+        };
+        void probe();
+        return () => { stopped = true; clearTimeout(timer); };
+      }, [visible, sessionId, transport, readState, readTransport]);
 
       // The pane decides the page's logical viewport: the desktop layout keeps a
       // fixed width so sites do not reflow into a phone layout in a narrow
@@ -670,30 +777,137 @@ window.__ModuleLoader__.load({
           const scale = room / logicalWidth;
           const logicalHeight = Math.max(200, Math.min(1600, Math.round(roomHeight / scale)));
           const fitted = Math.min(room / logicalWidth, roomHeight / logicalHeight);
-          setView({width: Math.round(logicalWidth * fitted), height: Math.round(logicalHeight * fitted), scale});
+          const picture = {width: Math.round(logicalWidth * fitted), height: Math.round(logicalHeight * fitted)};
+          // Fitting the pane width hands the page the whole stage at 100%; the
+          // desktop layout keeps its logical width, so the shell zooms the view
+          // until the picture it used to paint is the hole it now fills.
+          const hole = native && !wantsDesktop ? {width: room, height: roomHeight} : picture;
+          const rect = element.getBoundingClientRect();
+          geometry.current = {
+            left: rect.left, top: rect.top, room, roomHeight,
+            width: hole.width, height: hole.height,
+            zoom: native ? (wantsDesktop ? hole.width / logicalWidth : 1) : scale,
+          };
+          setView({width: hole.width, height: hole.height, scale});
           if (overlay.current && overlay.current.width === 0) {
             overlay.current.width = logicalWidth * 2;
             overlay.current.height = logicalHeight * 2;
           }
           setSize(previous => previous && previous.width === logicalWidth && previous.height === logicalHeight ? previous : {width: logicalWidth, height: logicalHeight});
         };
+        remeasure.current = measure;
         const observer = new ResizeObserver(() => { clearTimeout(timer); timer = setTimeout(measure, RESIZE_SETTLE_MS); });
         observer.observe(element);
         measure();
-        return () => { clearTimeout(timer); observer.disconnect(); };
-      }, [visible, zoom, desktop]);
+        return () => { clearTimeout(timer); remeasure.current = undefined; observer.disconnect(); };
+      }, [visible, zoom, desktop, native]);
+
+      // Native transport: the shell composites the page, so the pane's whole job
+      // is the hole — where the guest view goes, how far it is zoomed and whether
+      // it is on screen at all. Measuring is coalesced into one frame, and a
+      // report only leaves when one of those three actually changed.
+      const reportHole = React.useCallback(() => {
+        const hole = geometry.current;
+        const bounds = hole && hole.width >= 1 && hole.height >= 1
+          ? {x: Math.round(hole.left + (hole.room - hole.width) / 2), y: Math.round(hole.top + (hole.roomHeight - hole.height) / 2), width: hole.width, height: hole.height}
+          : null;
+        const zoomFactor = hole?.zoom ?? 1;
+        const shown = Boolean(bounds) && !occluded;
+        const previous = reported.current;
+        if (previous.sent && previous.visible === shown && previous.zoom === zoomFactor && sameBounds(previous.bounds, bounds)) return;
+        reported.current = {sent: true, bounds, zoom: zoomFactor, visible: shown};
+        void fetch(endpoint, {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify({action: "viewport", bounds, zoom: zoomFactor, visible: shown})})
+          .then(response => response.json().catch(() => ({})))
+          .then(value => { readTransport(value); })
+          // A report that did not arrive is retried by the next beat.
+          .catch(() => { reported.current.sent = false; });
+      }, [endpoint, occluded, readTransport]);
+
+      const scheduleHole = React.useCallback(() => {
+        if (pendingReport.current) return;
+        pendingReport.current = requestAnimationFrame(() => {
+          pendingReport.current = 0;
+          remeasure.current?.();
+          reportHole();
+        });
+      }, [reportHole]);
+
+      // Everything that moves, hides or shows the stage: the window resizing,
+      // the Sidebar collapsing, the terminal dock taking room, the page moving
+      // between the two surfaces.
+      React.useEffect(() => {
+        if (!native || !visible || !sessionId) return undefined;
+        const element = stage.current;
+        if (!element) return undefined;
+        const observer = new ResizeObserver(scheduleHole);
+        observer.observe(element);
+        window.addEventListener("resize", scheduleHole);
+        scheduleHole();
+        return () => {
+          if (pendingReport.current) cancelAnimationFrame(pendingReport.current);
+          pendingReport.current = 0;
+          observer.disconnect();
+          window.removeEventListener("resize", scheduleHole);
+        };
+      }, [native, visible, sessionId, scheduleHole]);
+
+      // A menu, the visit log, an error row or a switched-away tab hides the
+      // page, and every one of them is a change worth reporting at once.
+      React.useEffect(() => {
+        if (native) scheduleHole();
+      }, [native, occluded, zoom, desktop, active, scheduleHole]);
+
+      // Leaving the page — the Sidebar collapsing, the tab switching away, the
+      // other surface taking it over — takes the guest view away. The short wait
+      // keeps a surface that is only being replaced out of its heir's way.
+      React.useEffect(() => {
+        if (!native || !visible || !sessionId) return undefined;
+        const mine = (nativeOwner = ++nativeClaim);
+        return () => {
+          setTimeout(() => {
+            if (nativeOwner !== mine || reported.current.visible === false) return;
+            nativeOwner = 0;
+            reported.current = {sent: false, bounds: null, zoom: 1, visible: false};
+            void fetch(endpoint, {
+              method: "POST", headers: {"Content-Type": "application/json"}, keepalive: true,
+              body: JSON.stringify({action: "viewport", bounds: null, zoom: 1, visible: false}),
+            }).catch(() => { /* the Host hides the view with the surface */ });
+          }, NATIVE_RELEASE_MS);
+        };
+      }, [native, visible, sessionId, endpoint]);
+
+      // With the page on the compositor the pane has no frames to watch, so it
+      // keeps its chrome current, notices a fall back to frames and retries a
+      // report that failed, all from the same slow beat.
+      React.useEffect(() => {
+        if (!native || !visible || !sessionId) return undefined;
+        let stopped = false;
+        let timer;
+        const beatNative = async () => {
+          try {
+            const value = await readState();
+            if (stopped) return;
+            if (!readTransport(value) || value.transport === "native") adopt(value);
+          } catch { /* the next beat retries */ }
+          if (stopped) return;
+          scheduleHole();
+          timer = setTimeout(beatNative, NATIVE_STATE_MS);
+        };
+        void beatNative();
+        return () => { stopped = true; clearTimeout(timer); };
+      }, [native, visible, sessionId, readState, readTransport, adopt, scheduleHole]);
 
       // A stream that goes quiet, or one the Host reports as no longer sending
       // frames, is worth saying out loud; a page that simply stopped changing
       // is not, so the Host's beat decides.
       React.useEffect(() => {
-        if (!visible || !active) { setStale(false); return undefined; }
+        if (!visible || !active || native) { setStale(false); return undefined; }
         const timer = setInterval(() => {
           const quiet = beat.current.at > 0 && performance.now() - beat.current.at > STALE_MS * 2;
           setStale(quiet || beat.current.off >= 3);
         }, 1000);
         return () => clearInterval(timer);
-      }, [visible, active]);
+      }, [visible, active, native]);
 
       const post = async args => {
         const response = await fetch(endpoint, {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify(args)});
@@ -749,6 +963,7 @@ window.__ModuleLoader__.load({
             catch (again) { setError(copy(errorKey(again))); return; }
           }
           if (value.observation) observation.current = Math.max(observation.current, value.observation);
+          readTransport(value);
           if (value.tabs) setTabs(value.tabs);
           if (value.loading !== undefined) setLoading(Boolean(value.loading));
           if (value.canGoBack !== undefined) setNav({canGoBack: Boolean(value.canGoBack), canGoForward: Boolean(value.canGoForward)});
@@ -876,8 +1091,10 @@ window.__ModuleLoader__.load({
         send({action: "_input", kind: "key", key: name, observation: observation.current});
       };
 
-      const empty = !active;
-      return React.createElement("div", {className: "dsh-browser-body", "data-dsh-browser": "body", "data-dsh-browser-surface": placement},
+      return React.createElement("div", {
+        className: "dsh-browser-body", "data-dsh-browser": "body", "data-dsh-browser-surface": placement,
+        "data-dsh-browser-transport": native ? "native" : "screencast",
+      },
         React.createElement("div", {className: "dsh-browser-tabs", role: "tablist", "aria-label": copy("tabs"), "data-dsh-browser": "tabs"},
           tabs.map(entry => React.createElement("div", {
             key: entry.id, className: "dsh-browser-tab", "data-dsh-browser-tab": entry.id,
@@ -948,7 +1165,7 @@ window.__ModuleLoader__.load({
               "data-dsh-browser-action": "menu", "aria-expanded": menu?.kind === "tools" ? "true" : "false",
               onClick: event => { event.stopPropagation(); setMenu(menu?.kind === "tools" ? undefined : {kind: "tools"}); },
             }, "\u22ef"),
-            mode !== "stream" && React.createElement("span", {className: "dsh-browser-note", "data-dsh-browser-mode": mode}, copy("polling"))
+            !native && mode !== "stream" && React.createElement("span", {className: "dsh-browser-note", "data-dsh-browser-mode": mode}, copy("polling"))
           ),
           // The window group carries the surface the page is drawn on: the
           // Sidebar pane offers the main area, the main area offers the pane.
@@ -970,87 +1187,102 @@ window.__ModuleLoader__.load({
             className: "dsh-browser-view", "data-dsh-browser": "view",
             style: view.width ? {width: `${view.width}px`, height: `${view.height}px`} : undefined,
           },
-            React.createElement("canvas", {
-              ref: surface, className: "dsh-browser-frame", "data-dsh-browser": "frame",
-              "aria-label": copy("page"), style: {visibility: empty ? "hidden" : "visible"},
-            }),
-            React.createElement("canvas", {ref: overlay, className: "dsh-browser-overlay", "aria-hidden": "true"})
+            native
+              // The shell paints the page in a view of its own; the frame stays
+              // as the empty place in the layout the hole has to match.
+              ? React.createElement("div", {
+                  className: "dsh-browser-frame", "data-dsh-browser": "frame",
+                  "aria-label": copy("page"), style: {visibility: empty ? "hidden" : "visible"},
+                })
+              : React.createElement("canvas", {
+                  ref: surface, className: "dsh-browser-frame", "data-dsh-browser": "frame",
+                  "aria-label": copy("page"), style: {visibility: empty ? "hidden" : "visible"},
+                }),
+            !native && React.createElement("canvas", {ref: overlay, className: "dsh-browser-overlay", "aria-hidden": "true"})
           ),
           React.createElement("textarea", {
             ref: keyboard, className: "dsh-browser-keyboard", "aria-label": copy("keyboard"),
             "data-dsh-browser": "keyboard", autoComplete: "off", spellCheck: false,
-            onChange: event => { if (!composing.current && !event.nativeEvent.isComposing && event.target.value) { send({action: "_input", kind: "text", text: event.target.value, observation: observation.current}); event.target.value = ""; } },
-            onCompositionStart: () => { composing.current = true; },
-            onCompositionEnd: event => { composing.current = false; if (event.target.value) { send({action: "_input", kind: "text", text: event.target.value, observation: observation.current}); event.target.value = ""; } },
-            onPaste: event => {
-              const text = event.clipboardData?.getData("text");
-              if (!text) return;
-              event.preventDefault();
-              send({action: "_input", kind: "text", text, observation: observation.current});
-            },
-            onKeyDown: onKeyDown,
+            // A native page takes the keyboard itself, so nothing is forwarded
+            // from here; the field stays as the pane's own focus target.
+            ...(native ? {} : {
+              onChange: event => { if (!composing.current && !event.nativeEvent.isComposing && event.target.value) { send({action: "_input", kind: "text", text: event.target.value, observation: observation.current}); event.target.value = ""; } },
+              onCompositionStart: () => { composing.current = true; },
+              onCompositionEnd: event => { composing.current = false; if (event.target.value) { send({action: "_input", kind: "text", text: event.target.value, observation: observation.current}); event.target.value = ""; } },
+              onPaste: event => {
+                const text = event.clipboardData?.getData("text");
+                if (!text) return;
+                event.preventDefault();
+                send({action: "_input", kind: "text", text, observation: observation.current});
+              },
+              onKeyDown: onKeyDown,
+            }),
           }),
           React.createElement("div", {
             className: "dsh-browser-hit", "data-dsh-browser": "hit", tabIndex: 0, role: "application", "aria-label": copy("page"),
-            onMouseDown: event => { event.preventDefault(); keyboard.current?.focus({preventScroll: true}); },
-            onPointerDown: event => {
-              if (empty) return;
-              const point = toPagePoint(event, surface.current);
-              if (point) drag.current = {from: asFraction(point), origin: point, to: undefined};
-            },
-            onMouseMove: event => {
-              if (empty) return;
-              const point = toPagePoint(event, surface.current);
-              if (!point) { hoverLive.current = false; hover.current = undefined; hoverPoint.current = undefined; return; }
-              hoverLive.current = true;
-              probeHover(point.x, point.y);
-              if (drag.current) drag.current.to = asFraction(point);
-            },
-            onMouseLeave: () => { hoverLive.current = false; hover.current = undefined; hoverPoint.current = undefined; },
-            onMouseUp: event => {
-              const current = drag.current;
-              drag.current = undefined;
-              if (!current || empty || !current.to) return;
-              const point = toPagePoint(event, surface.current);
-              if (!point || Math.hypot(point.x - current.origin.x, point.y - current.origin.y) < 6) return;
-              // A real drag is not also a click.
-              swallowClick.current = true;
-              send({action: "_input", kind: "drag", from: current.from, to: current.to, observation: observation.current});
-            },
-            onClick: event => {
-              if (menu) { setMenu(undefined); swallowClick.current = false; return; }
-              if (swallowClick.current) { swallowClick.current = false; return; }
-              if (empty) return;
-              const point = toPagePoint(event, surface.current);
-              if (!point) return;
-              event.stopPropagation();
-              ripple.current = {x: point.x, y: point.y, at: performance.now()};
-              send({
-                action: "_input", kind: "click", point: asFraction(point),
-                clickCount: Math.max(1, Math.min(3, event.detail || 1)), observation: observation.current,
-              });
-            },
-            onContextMenu: event => {
-              event.preventDefault();
-              if (empty) return;
-              const rect = event.currentTarget.getBoundingClientRect();
-              setMenu({kind: "page", x: Math.max(4, event.clientX - rect.left), y: Math.max(4, event.clientY - rect.top)});
-            },
-            onWheel: event => {
-              if (empty) return;
-              const point = toPagePoint(event, surface.current);
-              if (!point) return;
-              wheelDelta.current += event.deltaY;
-              wheelPoint.current = asFraction(point);
-              if (wheelTimer.current) return;
-              wheelTimer.current = window.setTimeout(() => {
-                wheelTimer.current = 0;
-                const deltaY = Math.max(-1200, Math.min(1200, Math.round(wheelDelta.current)));
-                wheelDelta.current = 0;
-                if (deltaY === 0) return;
-                send({action: "_input", kind: "scroll", deltaY, point: wheelPoint.current, observation: observation.current});
-              }, WHEEL_FLUSH_MS);
-            },
+            // A native page receives real pointer input from the shell, so this
+            // layer only keeps the pane's own layout, menu and focus contract.
+            ...(native ? {} : {
+              onMouseDown: event => { event.preventDefault(); keyboard.current?.focus({preventScroll: true}); },
+              onPointerDown: event => {
+                if (empty) return;
+                const point = toPagePoint(event, surface.current);
+                if (point) drag.current = {from: asFraction(point), origin: point, to: undefined};
+              },
+              onMouseMove: event => {
+                if (empty) return;
+                const point = toPagePoint(event, surface.current);
+                if (!point) { hoverLive.current = false; hover.current = undefined; hoverPoint.current = undefined; return; }
+                hoverLive.current = true;
+                probeHover(point.x, point.y);
+                if (drag.current) drag.current.to = asFraction(point);
+              },
+              onMouseLeave: () => { hoverLive.current = false; hover.current = undefined; hoverPoint.current = undefined; },
+              onMouseUp: event => {
+                const current = drag.current;
+                drag.current = undefined;
+                if (!current || empty || !current.to) return;
+                const point = toPagePoint(event, surface.current);
+                if (!point || Math.hypot(point.x - current.origin.x, point.y - current.origin.y) < 6) return;
+                // A real drag is not also a click.
+                swallowClick.current = true;
+                send({action: "_input", kind: "drag", from: current.from, to: current.to, observation: observation.current});
+              },
+              onClick: event => {
+                if (menu) { setMenu(undefined); swallowClick.current = false; return; }
+                if (swallowClick.current) { swallowClick.current = false; return; }
+                if (empty) return;
+                const point = toPagePoint(event, surface.current);
+                if (!point) return;
+                event.stopPropagation();
+                ripple.current = {x: point.x, y: point.y, at: performance.now()};
+                send({
+                  action: "_input", kind: "click", point: asFraction(point),
+                  clickCount: Math.max(1, Math.min(3, event.detail || 1)), observation: observation.current,
+                });
+              },
+              onContextMenu: event => {
+                event.preventDefault();
+                if (empty) return;
+                const rect = event.currentTarget.getBoundingClientRect();
+                setMenu({kind: "page", x: Math.max(4, event.clientX - rect.left), y: Math.max(4, event.clientY - rect.top)});
+              },
+              onWheel: event => {
+                if (empty) return;
+                const point = toPagePoint(event, surface.current);
+                if (!point) return;
+                wheelDelta.current += event.deltaY;
+                wheelPoint.current = asFraction(point);
+                if (wheelTimer.current) return;
+                wheelTimer.current = window.setTimeout(() => {
+                  wheelTimer.current = 0;
+                  const deltaY = Math.max(-1200, Math.min(1200, Math.round(wheelDelta.current)));
+                  wheelDelta.current = 0;
+                  if (deltaY === 0) return;
+                  send({action: "_input", kind: "scroll", deltaY, point: wheelPoint.current, observation: observation.current});
+                }, WHEEL_FLUSH_MS);
+              },
+            }),
           }),
           menu && React.createElement("div", {
             className: "dsh-browser-menu", role: "menu", "data-dsh-browser": "menu", "data-dsh-browser-menu-kind": menu.kind,
