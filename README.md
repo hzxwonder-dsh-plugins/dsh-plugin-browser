@@ -1,5 +1,10 @@
 # DSH 浏览器插件
 
+## Desktop 原生浏览器（2026-09-27）
+
+官方 DeepSeek Harness Desktop 0.1.7-rc.2 中，插件识别 `dshDesktop` 原生桥接，侧栏使用官方浏览器界面。网页导航和重启后的标签恢复入口已实机验证。插件的 Agent 浏览器工具与论文工作台嵌入页面仍使用各自的浏览会话。
+
+
 `dsh-plugin-browser` 为 DeepSeek Harness Desktop 提供按 Session 隔离的 Chromium 浏览器，并在右侧栏显示同一个浏览器页面：
 
 - `browser` 工具使用按 Session 隔离的 Playwright Chromium，适合自动化操作、可访问性快照和截图。
