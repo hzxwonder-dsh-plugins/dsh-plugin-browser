@@ -1,6 +1,6 @@
 # DSH 浏览器插件
 
-`dsh-plugin-browser` 为网页版 DeepSeek Harness 提供按 Session 隔离的 Chromium 浏览器，并在右侧栏显示同一个浏览器页面：
+`dsh-plugin-browser` 为 DeepSeek Harness Desktop 提供按 Session 隔离的 Chromium 浏览器，并在右侧栏显示同一个浏览器页面：
 
 - `browser` 工具使用按 Session 隔离的 Playwright Chromium，适合自动化操作、可访问性快照和截图。
 - Web 右侧栏的 `浏览器` 页面通过官方 Sidebar 扩展 API 实时串流同一个页面，并把鼠标、键盘、导航和滚动输入转发回去。
@@ -15,12 +15,22 @@
 
 ## 宿主支持
 
-- 两端共用同一个包 `dsh-plugin-browser`，没有桌面端专用包。
-- Web 端：右侧栏 `浏览器` 页面用 CDP screencast 串流按 Session 隔离的 Chromium 页面。
-- 桌面端：宿主提供 `desktopNativeBrowser` 服务时，同一个面板改为把页面位置、缩放与可见性上报给宿主，由 Electron 主进程的原生视图承载页面（无编码串流、原生分辨率、鼠标键盘直达页面）；服务缺失或失败时自动回退到串流面板。
-- 桌面专属能力只用 `ctx.get?.('desktopNativeBrowser')` 在运行时探测，不放进顶层 `inject`，普通 Web 宿主照常加载；这符合 anywhere-labs/dsh-desktop 插件规范的[「兼容 Desktop 和普通 DSH」](https://github.com/anywhere-labs/dsh-desktop/blob/master/docs/plugin-development.md)写法。
-- 验证：桌面端已在 DSH Desktop 实例上实测（2026-09-15：agent 的 `browser` 工具打开页面取回标题与可访问性快照、右侧栏与主页区两个承载面的几何与缩放、面板菜单展开时的可见性）；Web 端验收 44 条中 42 条通过，另 2 条需要 `BROWSER_TEST_EXECUTABLE` 指向本机 Chrome。
-- 桌面端没有需要单独维护的仓库，两端由本仓库同一份实现维护。
+本仓库维护 [DeepSeek 官方 Desktop](https://github.com/deepseek-ai/deepseek-harness) 的独立适配插件。
+[DSH Omni](https://github.com/hzxwonder/dsh-omni) 的集成版由其 `vendor/` 单独维护。维护目标为这两个桌面产品，Web 端不再作为维护目标。
+
+### 官方 Desktop 验收
+
+2026-09-26，macOS arm64，官方签名的 DeepSeek Harness **0.1.7-rc.2**，通过应用插件管理页安装公开版本 **0.5.2**：安装、启用与面板通过；配置本机 Chrome 后实际导航成功。Agent 工具和完整交互待验收。
+
+官方内嵌浏览器使用 Electron webview，另有可选 browser-use 后端。本插件强调按会话隔离的 Playwright 与人机共享页面、串流和操作提示。
+
+[完整验收与官方功能对照](https://github.com/hzxwonder/dsh-omni/blob/main/docs/official-desktop-compatibility.md)。安装成功、组件运行与核心功能验收是不同阶段；兼容范围以实机报告为准。
+
+开发与发布顺序：DSH Omni 开发及实机验收 → 更新 Omni 仓库 → 官方 Desktop 适配及实机验收 → 发布本仓库。每次重新构建后重新实机验证。
+
+### 安装到官方 Desktop
+
+在官方应用中打开“插件 → 添加插件”，输入 `https://github.com/hzxwonder-dsh-plugins/dsh-plugin-browser`。安装器通过兼容性检查后再启用；按照上面的验收状态决定是否在日常配置使用。
 
 ## 功能截图
 
