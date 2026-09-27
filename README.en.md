@@ -73,6 +73,10 @@ Entries match the normalized origin exactly (scheme, host, and port; a path or q
 
 After the Web client extension is installed, the right Sidebar registers a `Browser` page:
 
+### Distribution
+
+This repository is the public adapter for the official DeepSeek Harness Desktop. [DSH Omni](https://github.com/hzxwonder/dsh-omni) integrates its pinned `vendor/dsh-plugin-browser` snapshot. The two editions share the browser capability but are validated against their hosts independently; Web is no longer a maintenance target. See the [compatibility report](https://github.com/hzxwonder/dsh-omni/blob/main/docs/official-desktop-compatibility.md) for the current official Desktop status.
+
 1. Open the Harness Web right Sidebar and select `Browser`. A tool navigation opens it automatically.
 2. Enter an HTTP(S) address in the address bar and press Enter; a tool navigation drives the same page. Focusing the address field opens `Visited pages`, newest first; a row returns to a page this Session has visited, and an empty log shows a placeholder.
 3. The toolbar is grouped into navigation, address, view, and window: Back, Forward, and Reload or Stop in the navigation group; the address field with its Enter `Go` in the address group; the `⋯` tools menu with the `Compatibility view` note in the view group; and the move between the two surfaces with `Close browser` in the window group. The error row is its own line with a `×` to dismiss it.
